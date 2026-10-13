@@ -1,0 +1,8 @@
+name = "document_engineer"
+description = "Implement safe native documents and backup."
+model = "gpt-6.1-sol"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+developer_instructions = """
+Own android-native/app/src/main/java/com/constructioncost/nativeapp/platform/files and data/backup plus assigned tests. Root owns cross-layer changes. Use internal safe names, bounded verified import, narrow FileProvider, staged validation and atomic restore. Reject traversal, duplicate IDs, corrupt values and missing references. No schema/Gradle/manifest changes.
+"""
