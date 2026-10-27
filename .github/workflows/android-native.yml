@@ -25,7 +25,7 @@ jobs:
       - name: Set up Android SDK tools
         uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
-          packages: "platform-tools platforms;android-37 build-tools;36.0.0"
+          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0"
       - name: Build and verify
         run: bash gradlew help :app:assembleDebug :app:assembleRelease :app:bundleRelease :app:testDebugUnitTest :app:lintDebug :app:lintRelease --no-daemon --console=plain
       - name: Enable emulator acceleration
