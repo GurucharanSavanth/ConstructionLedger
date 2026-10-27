@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <provider
+            android:name="com.constructioncost.nativeapp.platform.files.FailingDocumentProvider"
+            android:authorities="${applicationId}.fault"
+            android:exported="true" />
+    </application>
+</manifest>
