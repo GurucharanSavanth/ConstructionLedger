@@ -10,9 +10,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -21,13 +26,26 @@ jobs:
         with:
           distribution: temurin
           java-version: "25"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
       - uses: gradle/actions/setup-gradle@07d1f8453baaff67fb503883367f8b13e6158a54 # v6
       - name: Set up Android SDK tools
         uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
-        with:
-          packages: "platform-tools platforms;android-37.0 build-tools;36.0.0"
+      - name: Install compile platform
+        run: sdkmanager "platforms;android-37.0" "build-tools;36.0.0"
       - name: Build and verify
         run: bash gradlew help :app:assembleDebug :app:assembleRelease :app:bundleRelease :app:testDebugUnitTest :app:lintDebug :app:lintRelease --no-daemon --console=plain
+      - name: Verify device receipt checks
+        run: python3 -m unittest discover -s android-native/scripts -p 'test_device_receipts_test.py' -v
+      - name: Test legacy conversion
+        run: node --test android-native/scripts/convert-legacy.test.mjs android-native/scripts/convert-legacy-units.test.mjs
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: buildledger-debug
+          path: android-native/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
       - name: Enable emulator acceleration
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -41,23 +59,23 @@ jobs:
           arch: x86_64
           disable-animations: false
           script: |
+            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.OfflineManifestTest
             python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.data.local.LedgerMigrationTest
             python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.data.backup.BackupServiceTest
+            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.EmptyLedgerBackupTest
+            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.ui.ZeroProjectNavigationTest
+            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.data.repository.ProjectDeletionTest
+            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.data.export.ProjectWorkbookExportTest
             python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.ActivityRecreationTest
             python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.DocumentNavigationTest
             python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.LedgerOperationsTest
             python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --mode verification --class com.constructioncost.nativeapp.LedgerRestoreRecreationTest
-            bash gradlew :app:assembleDebug --console=plain
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: buildledger-debug
-          path: android-native/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: native-check-reports
           include-hidden-files: true
+          retention-days: 14
           path: |
             android-native/app/build/reports/tests/
             android-native/app/build/reports/lint-results-*
