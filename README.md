@@ -6,6 +6,16 @@ stores ledger records and original documents in private app storage; financial
 amounts are recorded in integer paise. No account or network connection is
 required.
 
+## Screenshots
+
+These screenshots show the Android app with synthetic sample data.
+
+<p align="center">
+  <img src="android-native/screenshots/dashboard.png" width="31%" alt="Project overview dashboard with sample bill totals" />
+  <img src="android-native/screenshots/explore.png" width="31%" alt="Cost explorer showing a sample cost category total" />
+  <img src="android-native/screenshots/activity.png" width="31%" alt="Activity screen showing the sample bill and audit history" />
+</p>
+
 The project requires Android Studio, JDK 17, and Android SDK 37. The app
 supports Android 8.0 (API 26) and newer.
 
