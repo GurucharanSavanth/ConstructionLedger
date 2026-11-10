@@ -96,7 +96,14 @@ class LegacyImportMapper(private val context: Context) {
         source.getValue("contracts").forEach { c ->
             record("commitments", "legacy:contract:${c.getString("id")}", "projectId" to projectId, "title" to c.getString("title"),
                 "amountPaise" to positive(c, "amount"), "vendorId" to vendor(c.optString("vendor")), "date" to date(c, "date", "createdAt"),
-                "revision" to 0L, "archived" to false)
+                "revision" to 0L, "archived" to false, "note" to c.optString("notes"),
+                "calculationJson" to c.optJSONObject("calculation")?.let { legacy ->
+                    JSONObject().put("quantity", legacy.getString("qty")).put("rate", legacy.getString("rate"))
+                        .put("multiplier", legacy.optString("multiplier", "1"))
+                        .put("quantityUnit", legacy.optionalString("quantityUnitId") ?: legacy.optionalString("unitId") ?: "unit")
+                        .put("rateUnit", legacy.optionalString("unitId") ?: "unit")
+                        .also { json -> listOf("discountAmount", "discountPercent", "taxAmount", "taxPercent", "transport", "adjustment").forEach { json.put(it, "0") } }.toString()
+                }.orEmpty())
             plannedClassification("contract", c)
             evidence("contract", c)
         }
@@ -109,7 +116,7 @@ class LegacyImportMapper(private val context: Context) {
             record("instalments", "legacy:plan:${p.getString("id")}", "projectId" to projectId, "title" to p.getString("title"),
                 "amountPaise" to positive(p, "amount"), "dueDate" to date(p, "due"),
                 "commitmentId" to contractId?.let { "legacy:contract:$it" }, "vendorId" to vendor(p.optString("vendor")),
-                "cancelled" to p.optBoolean("cancelled"), "remind" to (days >= 0), "revision" to 0L)
+                "cancelled" to p.optBoolean("cancelled"), "remind" to (days >= 0), "revision" to 0L, "note" to p.optString("notes"))
             record("reminders", "legacy:reminder:${p.getString("id")}", "instalmentId" to "legacy:plan:${p.getString("id")}", "enabled" to (days >= 0 && !p.optBoolean("cancelled")), "leadDays" to maxOf(0, days))
             plannedClassification("plan", p)
             evidence("plan", p)
@@ -138,8 +145,8 @@ class LegacyImportMapper(private val context: Context) {
                 record("expense_lines", "$billId:line:$index", "expenseId" to billId, "description" to label,
                     "amountPaise" to amount, "mode" to if (line.optString("mode") == "calculated") "CALCULATED" else "DIRECT_AMOUNT",
                     "quantity" to line.optString("qty").takeIf { it.isNotBlank() }, "rate" to line.optString("rate").takeIf { it.isNotBlank() },
-                    "multiplier" to line.optString("multiplier", "1"), "quantityUnit" to line.optString("quantityUnitId", "unit"),
-                    "rateUnit" to line.optString("unitId", "unit"), "legacyJson" to line.toString(),
+                    "multiplier" to line.optString("multiplier", "1"), "quantityUnit" to (line.optionalString("quantityUnitId") ?: line.optionalString("unitId") ?: "unit"),
+                    "rateUnit" to (line.optionalString("unitId") ?: "unit"), "legacyJson" to line.toString(),
                     "nature" to (line.optionalString("costNature") ?: bill.optionalString("costNature").orEmpty()))
                 if (amount == 0L) return@forEachIndexed
                 val work = workNode(line.optString("work", bill.optString("work")), line.optString("substage", bill.optString("substage")), label)

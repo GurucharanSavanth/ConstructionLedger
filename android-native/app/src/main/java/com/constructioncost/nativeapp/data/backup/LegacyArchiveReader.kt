@@ -3,6 +3,7 @@ package com.constructioncost.nativeapp.data.backup
 import android.content.Context
 import android.net.Uri
 import com.constructioncost.nativeapp.platform.files.DocumentPolicy
+import com.constructioncost.nativeapp.platform.files.availablePrivateBytes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -28,7 +29,7 @@ class LegacyArchiveReader(private val context: Context) {
         val directory = File(context.cacheDir, "legacy-${UUID.randomUUID()}").apply { check(mkdirs()) }
         try {
             val archive = context.contentResolver.openInputStream(source)?.use { ArchiveIO.stage(it, directory) } ?: error("Cannot open legacy backup")
-            val entries = ArchiveIO.extract(archive, directory, legacy = true)
+            val entries = ArchiveIO.extract(archive, directory, legacy = true) { availablePrivateBytes(context, directory) }
             val header = JSONObject(entries["header.json"]?.readText() ?: error("Legacy backup header is missing"))
             require(header.get("product") == "BuildLedger" && header.get("format") == 1 && header.get("encrypted") == true && header.get("kdf") == "PBKDF2-SHA256" && header.get("iterations") == 250000) { "Unsupported legacy encryption format" }
             val salt = decode(header.getString("salt"), 16)
@@ -58,7 +59,7 @@ class LegacyArchiveReader(private val context: Context) {
                 val metaSize = meta.get("size")
                 require((expectedSize is Long || expectedSize is Int) && (metaSize is Long || metaSize is Int) && item.getLong("size") == meta.getLong("size") && item.getLong("size") in 1..DocumentPolicy.MAX_FILE_BYTES) { "Invalid legacy document size" }
                 require(item.getString("sha256") == meta.getString("sha256") && (item.getString("type") == meta.getString("type") || item.getString("type") == "application/octet-stream")) { "Legacy document metadata mismatch" }
-                require(directory.usableSpace > item.getLong("size") + 1024 * 1024) { "Not enough storage to decrypt legacy document" }
+                require(availablePrivateBytes(context, directory) > item.getLong("size") + 1024 * 1024) { "Not enough storage to decrypt legacy document" }
                 val plain = File(directory, "document-$index")
                 decrypt(entries[item.getString("path")] ?: error("Legacy original document bytes are missing"), plain, key, item.getString("iv"), legacyDecryptLimit(Runtime.getRuntime().maxMemory(), false))
                 require(plain.length() == item.getLong("size") && DocumentPolicy.sha256(plain) == item.getString("sha256")) { "Legacy document checksum or size mismatch" }

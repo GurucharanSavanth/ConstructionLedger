@@ -21,6 +21,10 @@ class MoneyTest {
         assertEquals(1112000L, Money.calculate("1", "10000", discountPercent = "10", taxPercent = "18", transport = "500").totalPaise)
         assertEquals(1850000L, Money.parse("१८५००"))
     }
+    @Test fun decimalZeroCanAccompanyPercentageCharges() {
+        assertEquals(9_000L, Money.calculate("1", "100", discountAmount = "0.00", discountPercent = "10").totalPaise)
+        assertEquals(11_800L, Money.calculate("1", "100", taxAmount = "0.00", taxPercent = "18").totalPaise)
+    }
     @Test fun settlementReferenceFixtures() {
         assertEquals(600000L, Settlement.outstanding(1000000, listOf(400000)))
         assertEquals(0L, Settlement.outstanding(1000000, listOf(400000, 600000)))
@@ -39,6 +43,12 @@ class MoneyTest {
         assertEquals(1L, Money.calculate("0.5", "0.03", discountPercent = "10").totalPaise)
         assertEquals(2L, Money.calculate("0.5", "0.03", discountPercent = "10", taxPercent = "18").totalPaise)
         assertEquals(10000L, Money.calculate("100", "100", quantityUnit = "sqft", rateUnit = "sq100").totalPaise)
+    }
+    @Test fun finalTotalRoundsOnceWhenDisplayedComponentsRoundIndependently() {
+        val calculation = Money.calculate("0.5", "0.01", taxPercent = "100")
+        assertEquals(1L, calculation.basePaise)
+        assertEquals(1L, calculation.taxPaise)
+        assertEquals(1L, calculation.totalPaise)
     }
     @Test fun anchoredMonthEndDates() {
         assertEquals(listOf("2026-01-31", "2026-02-28", "2026-03-31"), Money.scheduleDates(LocalDate.parse("2026-01-31"), 3, true).map { it.toString() })

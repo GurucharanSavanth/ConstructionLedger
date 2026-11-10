@@ -8,13 +8,16 @@ import android.net.Uri
 import com.constructioncost.nativeapp.domain.Money
 import com.constructioncost.nativeapp.domain.LedgerSummary
 import com.constructioncost.nativeapp.data.repository.LedgerRepository
+import com.constructioncost.nativeapp.platform.OperationProgress
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
 import java.time.LocalDate
 
 object LedgerExports {
-    suspend fun csv(resolver: ContentResolver, target: Uri, repository: LedgerRepository, projectId: String) = withContext(Dispatchers.IO) {
+    suspend fun csv(resolver: ContentResolver, target: Uri, repository: LedgerRepository, projectId: String, onProgress: (String) -> Unit = {}) = withContext(Dispatchers.IO) {
+        val progress = OperationProgress("CSV export", onProgress)
+        progress.phase("Exporting CSV rows")
+        var count = 0
         resolver.openOutputStream(target, "wt")?.bufferedWriter(Charsets.UTF_8)?.use { output ->
             output.write("\uFEFF")
             output.appendLine(csvHeader.joinToString(",", transform = ::csvCell))
@@ -57,8 +60,14 @@ object LedgerExports {
                     }
                 }
                 output.appendLine(csvHeader.map { fields[it].orEmpty() }.joinToString(",", transform = ::csvCell))
+                count++
+                if (count % 250 == 0) progress.count(count)
             }
+            progress.count(count)
+            progress.phase("Flushing CSV file")
         } ?: error("Cannot create CSV destination")
+        progress.finish()
+        Unit
     }
     internal val csvHeader = listOf("Record Type", "Source ID", "Date", "Description", "Supplier", "Recorded Cost INR",
         "Cash Outflow INR", "Outstanding INR", "Settled INR", "Planned Amount INR", "Commitment INR",
@@ -69,7 +78,9 @@ object LedgerExports {
         return "\"${safe.replace("\"", "\"\"")}\""
     }
 
-    suspend fun pdf(resolver: ContentResolver, target: Uri, summary: LedgerSummary, projectName: String) = withContext(Dispatchers.IO) {
+    suspend fun pdf(resolver: ContentResolver, target: Uri, summary: LedgerSummary, projectName: String, onProgress: (String) -> Unit = {}) = withContext(Dispatchers.IO) {
+        val progress = OperationProgress("PDF export", onProgress)
+        progress.phase("Drawing project summary")
         val document = PdfDocument()
         try {
             val page = document.startPage(PdfDocument.PageInfo.Builder(595, 842, 1).create())
@@ -86,7 +97,10 @@ object LedgerExports {
             canvas.drawText("Budget: ${summary.budgetPaise?.let { Money.input(it) + " INR" } ?: "Not set"}", 42f, 280f, body)
             canvas.drawText("Agreed commitments: ${Money.input(summary.commitmentPaise)} INR", 42f, 309f, body)
             document.finishPage(page)
+            progress.phase("Saving PDF report")
             resolver.openOutputStream(target, "wt")?.use(document::writeTo) ?: error("Cannot create PDF destination")
         } finally { document.close() }
+        progress.finish()
+        Unit
     }
 }

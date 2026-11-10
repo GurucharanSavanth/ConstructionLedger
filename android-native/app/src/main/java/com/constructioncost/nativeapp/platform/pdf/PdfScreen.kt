@@ -13,15 +13,40 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import androidx.core.graphics.createBitmap
 import com.constructioncost.nativeapp.domain.AttachmentInfo
 import com.constructioncost.nativeapp.platform.files.AttachmentStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.withContext
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+
+internal suspend fun renderPdfPage(renderer: PdfRenderer, page: Int, width: Int, zoom: Float): Bitmap {
+    currentCoroutineContext().ensureActive()
+    require(page in 0 until renderer.pageCount) { "Page no longer exists." }
+    return renderer.openPage(page).use { sheet ->
+        val wanted = (width * 2.5f * zoom).roundToInt().coerceAtLeast(1)
+        val scale = min(wanted.toFloat() / sheet.width,
+            sqrt(8_000_000f / (sheet.width.toFloat() * sheet.height)))
+        val pixels = createBitmap((sheet.width * scale).roundToInt().coerceAtLeast(1),
+            (sheet.height * scale).roundToInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        try {
+            pixels.eraseColor(Color.WHITE)
+            sheet.render(pixels, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            currentCoroutineContext().ensureActive()
+            pixels
+        } catch (failure: Throwable) { pixels.recycle(); throw failure }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -31,33 +56,34 @@ fun PdfScreen(info: AttachmentInfo, store: AttachmentStore, onBack: () -> Unit) 
     var pageCount by remember(info.id) { mutableIntStateOf(0) }
     var bitmap by remember(info.id) { mutableStateOf<Bitmap?>(null) }
     var error by remember(info.id) { mutableStateOf<String?>(null) }
-    val width = LocalConfiguration.current.screenWidthDp
+    var viewportWidth by remember { mutableIntStateOf(0) }
+    val density = LocalDensity.current
+    val currentWidth by rememberUpdatedState(viewportWidth)
 
-    LaunchedEffect(info.id, page, zoom, width) {
+    LaunchedEffect(info) {
         bitmap = null
         error = null
         try {
-            val result = withContext(Dispatchers.IO) {
+            withContext(Dispatchers.IO) {
+                // Immutable originals are verified once; this session owns the descriptor and renderer until exit.
                 store.openPdf(info).use { descriptor ->
                     PdfRenderer(descriptor).use { renderer ->
                         require(renderer.pageCount > 0) { "PDF has no pages." }
-                        require(page in 0 until renderer.pageCount) { "Page no longer exists." }
-                        renderer.openPage(page).use { sheet ->
-                            val wanted = (width * 2.5f * zoom).roundToInt().coerceAtLeast(1)
-                            val scale = min(wanted.toFloat() / sheet.width,
-                                sqrt(8_000_000f / (sheet.width.toFloat() * sheet.height)))
-                            val pixels = Bitmap.createBitmap((sheet.width * scale).roundToInt().coerceAtLeast(1),
-                                (sheet.height * scale).roundToInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888)
-                            pixels.eraseColor(Color.WHITE)
-                            sheet.render(pixels, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                            renderer.pageCount to pixels
+                        withContext(Dispatchers.Main) { pageCount = renderer.pageCount }
+                        snapshotFlow { Triple(page, zoom, currentWidth) }.filter { it.third > 0 }
+                            .collectLatest { (requestedPage, requestedZoom, requestedWidth) ->
+                            withContext(Dispatchers.Main) { bitmap = null }
+                            val rendered = renderPdfPage(renderer, requestedPage, requestedWidth, requestedZoom)
+                            var published = false
+                            try {
+                                withContext(Dispatchers.Main) { bitmap = rendered; published = true }
+                            } finally { if (!published) rendered.recycle() }
                         }
                     }
                 }
             }
-            pageCount = result.first
-            bitmap = result.second
-        } catch (failure: Exception) {
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (failure: Exception) {
             error = when (failure) {
                 is SecurityException -> "This PDF is locked or cannot be opened."
                 else -> "Cannot render PDF: ${failure.message ?: "file is damaged or unsupported"}"
@@ -81,9 +107,15 @@ fun PdfScreen(info: AttachmentInfo, store: AttachmentStore, onBack: () -> Unit) 
             }
             error?.let { Text(it, Modifier.padding(20.dp), color = MaterialTheme.colorScheme.error) }
             if (bitmap == null && error == null) LinearProgressIndicator(Modifier.fillMaxWidth())
-            bitmap?.let { image ->
-                Box(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState())) {
-                    Image(image.asImageBitmap(), "PDF page ${page + 1} of $pageCount", Modifier.width((width * zoom).dp).padding(8.dp))
+            BoxWithConstraints(Modifier.fillMaxSize().onSizeChanged {
+                viewportWidth = with(density) { it.width.toDp().value.roundToInt() }
+            }) {
+                val imageWidth = maxWidth * zoom
+                bitmap?.let { image ->
+                    Box(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState())) {
+                        Image(image.asImageBitmap(), "PDF page ${page + 1} of $pageCount",
+                            Modifier.width(imageWidth).padding(8.dp))
+                    }
                 }
             }
         }

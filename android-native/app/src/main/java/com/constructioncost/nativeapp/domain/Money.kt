@@ -30,10 +30,11 @@ object Money {
     fun post(rupees: BigDecimal): Long = rupees.multiply(hundred).setScale(0, RoundingMode.HALF_UP).longValueExact()
     fun sum(values: Iterable<Long>): Long = values.fold(0L, Math::addExact)
     fun input(paise: Long): String = BigDecimal.valueOf(paise, 2).toPlainString()
-    fun format(paise: Long): String {
-        val amount = BigDecimal.valueOf(paise, 2)
+    fun format(paise: Long): String = format(BigInteger.valueOf(paise))
+    fun format(paise: BigInteger): String {
+        val amount = BigDecimal(paise, 2)
         val format = java.text.NumberFormat.getCurrencyInstance(Locale.forLanguageTag("en-IN"))
-        format.minimumFractionDigits = if (paise % 100 == 0L) 0 else 2
+        format.minimumFractionDigits = if (paise.remainder(BigInteger.valueOf(100)) == BigInteger.ZERO) 0 else 2
         return format.format(amount)
     }
 
@@ -60,8 +61,8 @@ object Money {
         val discountRate = decimal(discountPercent)
         val taxRate = decimal(taxPercent)
         require(discountRate <= hundred && taxRate <= hundred) { "Percentage must be between zero and 100." }
-        require(decimal(discountAmount) == BigDecimal.ZERO || discountRate == BigDecimal.ZERO) { "Choose discount amount or percentage." }
-        require(decimal(taxAmount) == BigDecimal.ZERO || taxRate == BigDecimal.ZERO) { "Choose tax amount or percentage." }
+        require(decimal(discountAmount).compareTo(BigDecimal.ZERO) == 0 || discountRate.compareTo(BigDecimal.ZERO) == 0) { "Choose discount amount or percentage." }
+        require(decimal(taxAmount).compareTo(BigDecimal.ZERO) == 0 || taxRate.compareTo(BigDecimal.ZERO) == 0) { "Choose tax amount or percentage." }
         val discount = decimal(discountAmount).add(base.multiply(discountRate).divide(hundred))
         require(discount <= base) { "Discount exceeds base amount." }
         val discounted = base.subtract(discount)

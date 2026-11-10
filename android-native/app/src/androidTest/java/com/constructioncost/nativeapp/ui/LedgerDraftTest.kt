@@ -1,6 +1,7 @@
 package com.constructioncost.nativeapp.ui
 
 import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModelStore
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.constructioncost.nativeapp.data.repository.LedgerRepository
@@ -11,11 +12,93 @@ import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class LedgerDraftTest {
+    @Test fun enteredMetadataProtectsDraftAcrossProjectSwitchAndAllReplacementEntrypoints() = runBlocking {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val repository = LedgerRepository.inMemory(context)
+        val preferences = TestPreferences()
+        val models = ViewModelStore()
+        try {
+            repository.saveProject(ProjectInfo("first", "First"))
+            repository.saveProject(ProjectInfo("second", "Second"))
+            val original = EntryDraft.fresh("first").with("quantity", "7").with("vendor", "supplier")
+                .with("WORK", "stage").with("attachments", "original-file").with("timerSeconds", "4")
+            val model = LedgerViewModel(context, repository,
+                SavedStateHandle(mapOf("project" to "first", "draft" to original.json())), preferences.store)
+            models.put("draft-protection", model)
+            withTimeout(5_000) { model.state.first { it.ready } }
+            assertTrue(original.hasContent)
+            listOf("quantity" to "7", "vendor" to "supplier", "WORK" to "stage",
+                "attachments" to "original-file", "timerStarted" to "123", "invoiceNumber" to "INV-1")
+                .forEach { (key, value) -> assertTrue("$key should protect the draft", EntryDraft.fresh("first").with(key, value).hasContent) }
+            var navigations = 0
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                model.selectProject("second")
+                model.openNewEntry("Plan") { navigations++ }
+                assertTrue(model.state.value.pendingDraftReplacement)
+                model.cancelDraftReplacement()
+                model.editExpense("expense") { navigations++ }
+                assertTrue(model.state.value.pendingDraftReplacement)
+                model.cancelDraftReplacement()
+                model.editInstalment(InstalmentRow("plan", "second", "Plan", 100, "2026-10-23")) { navigations++ }
+                assertTrue(model.state.value.pendingDraftReplacement)
+                model.cancelDraftReplacement()
+                model.editCommitment(CommitmentInfo("contract", "second", "Contract", 100)) { navigations++ }
+                assertTrue(model.state.value.pendingDraftReplacement)
+                model.cancelDraftReplacement()
+                model.editNote(ActivityNote("note", "second", "Work", "2026-10-23", "")) { navigations++ }
+                assertTrue(model.state.value.pendingDraftReplacement)
+                model.cancelDraftReplacement()
+                model.preparePayment(then = { navigations++ })
+                assertTrue(model.state.value.pendingDraftReplacement)
+                model.cancelDraftReplacement()
+                assertEquals(original, model.state.value.draft)
+                assertEquals(0, navigations)
+                model.openNewEntry("Payment") { navigations++ }
+                model.confirmDraftReplacement()
+                assertEquals("Payment", model.state.value.draft.kind)
+                assertEquals("second", model.state.value.draft.projectId)
+                assertEquals(1, navigations)
+                model.field("amount", "100")
+                val payment = model.state.value.draft
+                model.openNewEntry("Payment") { navigations++ }
+                assertFalse(model.state.value.pendingDraftReplacement)
+                assertEquals(payment, model.state.value.draft)
+                assertEquals(2, navigations)
+            }
+        } finally {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync { models.clear() }
+            preferences.close()
+            repository.close()
+        }
+    }
+
+    @Test fun fullPaymentTracksChangedFinalAmount() {
+        val draft = EntryDraft.fresh("project").with("description", "Cement").with("amount", "100")
+            .with("paidStatus", "Full").with("paid", "100")
+        assertEquals(20_000L, LedgerViewModel.expense(draft.with("amount", "200")).paidPaise)
+        assertEquals(5_000L, LedgerViewModel.expense(draft.with("amount", "50")).paidPaise)
+        assertEquals(31_350L, LedgerViewModel.expense(draft.with("mode", "CALCULATED")
+            .with("quantity", "2.5").with("rate", "125.40")).paidPaise)
+    }
+
+    @Test fun partialPaymentRequiresPositiveAmountBelowTotal() {
+        val draft = EntryDraft.fresh("project").with("description", "Cement").with("amount", "100")
+            .with("paidStatus", "Partial")
+        for (paid in listOf("", "0", "100", "101")) {
+            org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+                LedgerViewModel.expense(draft.with("paid", paid))
+            }
+        }
+        assertEquals(4_000L, LedgerViewModel.expense(draft.with("paid", "40")).paidPaise)
+        assertEquals(0L, LedgerViewModel.expense(draft.with("paidStatus", "Unpaid").with("paid", "40")).paidPaise)
+    }
+
     @Test fun invoiceChargesApportionOnceAndRepeatedEditingDoesNotDrift() {
         val first = LedgerViewModel.withLineClasses(ExpenseLineInput("material", "Material", 700000), mapOf("WORK" to "foundation"))
         val second = LedgerViewModel.withLineClasses(ExpenseLineInput("labour", "Labour", 300000), mapOf("WORK" to "walls"))
@@ -72,7 +155,7 @@ class LedgerDraftTest {
             repository.saveClassification(ClassificationInfo("stage", "project", "Foundation", "STAGE"))
             repository.saveCommitment(CommitmentInput("agreement", "project", "Masonry", 100_000, "2026-01-01",
                 schedules = listOf(
-                    InstalmentInput("part-1", "project", "First", 50_000, "2026-02-01", "agreement"),
+                    InstalmentInput("part-1", "project", "First", 50_000, "2026-02-01", "agreement", remind = true, reminderDays = 7),
                     InstalmentInput("part-2", "project", "Second", 50_000, "2026-03-01", "agreement")
                 ), classificationIds = listOf("stage")))
             repository.savePayment(PaymentInput("cash", projectId = "project", amountPaise = 20_000,
@@ -98,8 +181,73 @@ class LedgerDraftTest {
             repository.saveCommitment(dateEdit)
             val after = repository.instalments("project").first().single { it.id == "part-1" }
             assertEquals("2026-02-05", after.dueDate)
+            assertEquals(7, after.reminderDays)
+            assertTrue(after.remind)
             assertEquals(20_000L, after.paidPaise)
             assertEquals("part-1", repository.payments("project").first().single().instalmentId)
+        } finally { repository.close() }
+    }
+
+    @Test fun commitmentResizePreviewsExactProportionsAndPreservesScheduleEvidence() {
+        val agreement = CommitmentInfo("agreement", "project", "Masonry", 1_000, vendorId = "vendor", date = "2026-01-01", revision = 4)
+        val plans = listOf(
+            InstalmentRow("first", "project", "Masonry deposit", 333, "2026-02-01", "agreement", "vendor",
+                paidPaise = 100, revision = 8, remind = true, reminderDays = 14),
+            InstalmentRow("second", "project", "Final inspection", 667, "2026-03-01", "agreement", "vendor", revision = 9, reminderDays = 0))
+        val draft = LedgerViewModel.draftForCommitment(agreement, plans).with("amount", "10.01").with("description", "Brickwork")
+        val result = LedgerViewModel.commitment(draft)
+        assertEquals(listOf(333L, 668L), result.schedules.map { it.amountPaise })
+        assertEquals(result.amountPaise, Money.sum(result.schedules.map { it.amountPaise }))
+        assertEquals(plans.map { it.id }, result.schedules.map { it.id })
+        assertEquals(plans.map { it.dueDate }, result.schedules.map { it.dueDate })
+        assertEquals(plans.map { it.revision }, result.schedules.map { it.revision })
+        assertEquals(plans.map { it.reminderDays }, result.schedules.map { it.reminderDays })
+        assertEquals(listOf("Brickwork deposit", "Final inspection"), result.schedules.map { it.title })
+        val preview = LedgerViewModel.commitmentScheduleRows(draft)
+        assertEquals(result.schedules.map { it.amountPaise }, List(preview.length()) { Money.parse(preview.getJSONObject(it).getString("amount")) })
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) { LedgerViewModel.commitment(draft.with("amount", "1")) }
+        val custom = org.json.JSONArray(draft.get("originalSchedules"))
+        custom.getJSONObject(0).put("amount", "4.01").put("date", "2026-02-05")
+        custom.getJSONObject(1).put("amount", "6.00")
+        val explicit = LedgerViewModel.commitment(draft.with("schedules", custom.toString()))
+        assertEquals(listOf(401L, 600L), explicit.schedules.map { it.amountPaise })
+        assertEquals("2026-02-05", explicit.schedules.first().dueDate)
+        val renamed = draft.with("description", "Masonry phase")
+        val retainedPreview = LedgerViewModel.commitmentScheduleRows(renamed).toString()
+        assertEquals("Masonry phase deposit", LedgerViewModel.commitment(renamed.with("schedules", retainedPreview)).schedules.first().title)
+    }
+
+    @Test fun commitmentResizeAndPropagationAreAtomicWhenHistoricalPaymentsConflict() = runBlocking {
+        val repository = LedgerRepository.inMemory(InstrumentationRegistry.getInstrumentation().targetContext)
+        try {
+            repository.saveProject(ProjectInfo("project", "Build"))
+            repository.saveVendor(VendorInfo("old", "project", "Original supplier"))
+            repository.saveVendor(VendorInfo("new", "project", "New supplier"))
+            repository.saveClassification(ClassificationInfo("stage", "project", "Foundation", "STAGE"))
+            repository.saveCommitment(CommitmentInput("agreement", "project", "Masonry", 1_000, "2026-01-01", "old",
+                schedules = listOf(InstalmentInput("part", "project", "Masonry stage", 1_000, "2026-02-01",
+                    "agreement", "old", remind = true, reminderDays = 10))))
+            val original = repository.commitments("project").first().single()
+            val draft = LedgerViewModel.draftForCommitment(original, repository.instalments("project").first())
+                .with("amount", "12").with("description", "Brickwork").with("vendor", "new")
+                .with("WORK", "stage").with("plannedChangedWORK", "true")
+            repository.saveCommitment(LedgerViewModel.commitment(draft))
+            val plan = repository.instalments("project").first().single()
+            assertEquals(1_200L, plan.amountPaise)
+            assertEquals("Brickwork stage", plan.title)
+            assertEquals("new", plan.vendorId)
+            assertEquals(10, plan.reminderDays)
+            assertEquals(listOf("stage"), repository.plannedClassifications("INSTALMENT", plan.id))
+            repository.savePayment(PaymentInput("paid", projectId = "project", amountPaise = 500,
+                date = "2026-01-15", vendorId = "new", instalmentId = plan.id))
+            val paidDraft = LedgerViewModel.draftForCommitment(repository.commitments("project").first().single(),
+                repository.instalments("project").first()).with("vendor", "old").with("amount", "15")
+            org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+                runBlocking { repository.saveCommitment(LedgerViewModel.commitment(paidDraft)) }
+            }
+            assertEquals(1_200L, repository.commitments("project").first().single().amountPaise)
+            assertEquals("new", repository.commitments("project").first().single().vendorId)
+            assertEquals(500L, repository.instalments("project").first().single().paidPaise)
         } finally { repository.close() }
     }
 

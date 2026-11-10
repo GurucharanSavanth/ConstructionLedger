@@ -1,14 +1,54 @@
 package com.constructioncost.nativeapp.platform.files
 
+import android.content.Context
+import android.net.Uri
+import com.constructioncost.nativeapp.data.local.LedgerRecoveryStateStore
 import java.io.File
 import java.io.InputStream
+import java.io.IOException
 import java.io.OutputStream
+import java.nio.file.Files
 import java.security.MessageDigest
 import com.constructioncost.nativeapp.domain.MAX_ATTACHMENT_BYTES
 
 object DocumentPolicy {
+    fun checkExportDestination(context: Context, destination: Uri) {
+        val ownProvider = destination.scheme == "content" &&
+            destination.authority?.substringAfterLast('@') == "${context.packageName}.files"
+        val protectedFile = if (destination.scheme == "file") {
+            val target = File(requireNotNull(destination.path)).canonicalFile.toPath()
+            listOf(context.filesDir, requireNotNull(context.getDatabasePath(LedgerRecoveryStateStore.DATABASE_NAME).parentFile))
+                .any { target.startsWith(it.canonicalFile.toPath()) }
+        } else false
+        require(!ownProvider && !protectedFile) { "Choose an export destination outside BuildLedger's private storage. Original records are preserved" }
+    }
+
+    val categories = listOf("Architectural drawings", "Structural drawings", "Sump and underground", "Survey / CAD",
+        "Lift and equipment", "MEP drawings", "Bills and proof", "Agreements", "Site photographs", "Approvals", "Warranties", "Miscellaneous")
+    fun cleanupArchiveStaging(directory: File, createdBefore: Long) {
+        val root = directory.canonicalFile
+        val uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        val stagingName = Regex("(?:backup|legacy)-$uuid")
+        val candidateName = Regex("candidate-$uuid\\.db(?:-(?:wal|shm|journal))?")
+        for (file in directory.listFiles().orEmpty()) {
+            if (file.lastModified() >= createdBefore || Files.isSymbolicLink(file.toPath()) || file.canonicalFile.parentFile != root) continue
+            if (file.isFile && candidateName.matches(file.name)) {
+                val databaseName = file.name.substringBefore(".db") + ".db"
+                if (listOf("", "-wal", "-shm", "-journal").any { suffix ->
+                    directory.resolve(databaseName + suffix).let { it.exists() && it.lastModified() >= createdBefore }
+                }) continue
+                check(file.delete()) { "Cannot remove interrupted archive validation" }
+            } else if (file.isDirectory && stagingName.matches(file.name)) {
+                val contents = file.listFiles() ?: continue
+                if (contents.any { !it.isFile || Files.isSymbolicLink(it.toPath()) || it.lastModified() >= createdBefore ||
+                    it.canonicalFile.parentFile != file.canonicalFile }) continue
+                contents.forEach { check(it.delete()) { "Cannot remove interrupted archive staging" } }
+                check(file.delete()) { "Cannot remove interrupted archive staging" }
+            }
+        }
+    }
     fun cleanupCameraFiles(directory: File, pendingName: String?, createdBefore: Long) {
-        directory.listFiles()?.filter { it.isFile && it.name != pendingName &&
+        directory.listFiles()?.filter { it.isFile && it.length() == 0L && it.name != pendingName &&
             it.name.matches(Regex("photo-[0-9a-fA-F-]{36}\\.jpg")) && it.lastModified() < createdBefore && it.canonicalFile.parentFile == directory.canonicalFile }
             ?.forEach { check(it.delete()) { "Cannot remove interrupted photo capture" } }
     }
@@ -24,6 +64,7 @@ object DocumentPolicy {
         while (true) {
             val read = input.read(buffer)
             if (read < 0) break
+            if (read == 0) throw IOException("Document stream stopped returning data")
             count += read
             require(count <= limit) { "Document exceeds the $limit byte limit" }
             output.write(buffer, 0, read)

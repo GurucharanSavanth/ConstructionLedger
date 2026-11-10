@@ -16,7 +16,7 @@ internal object ArchiveIO {
         archive.outputStream().use { DocumentPolicy.copy(input, it, MAX_ARCHIVE_BYTES) }
         return archive
     }
-    fun extract(archive: File, directory: File, legacy: Boolean = false): Map<String, File> {
+    fun extract(archive: File, directory: File, legacy: Boolean = false, availableBytes: () -> Long): Map<String, File> {
         require(archive.length() <= MAX_ARCHIVE_BYTES) { "Archive exceeds 850 MiB" }
         val files = linkedMapOf<String, File>()
         var total = 0L
@@ -38,7 +38,7 @@ internal object ArchiveIO {
                 }
                 require(entry.size in 0..limit) { "Archive entry exceeds its size limit: $name" }
                 require(total + entry.size <= MAX_ARCHIVE_BYTES) { "Archive expanded size exceeds 850 MiB" }
-                require(directory.usableSpace > entry.size + 1024 * 1024) { "Not enough private storage to inspect the archive" }
+                require(availableBytes() > entry.size + 1024 * 1024) { "Not enough private storage to inspect the archive" }
                 val target = File(directory, "entry-${files.size}")
                 val crc = java.util.zip.CRC32()
                 var size = 0L

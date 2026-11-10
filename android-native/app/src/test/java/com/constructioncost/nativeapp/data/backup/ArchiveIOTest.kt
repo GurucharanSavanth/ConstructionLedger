@@ -13,12 +13,12 @@ class ArchiveIOTest {
         try {
             val archive = File(directory, "archive.zip")
             write(archive, mapOf("manifest.json" to "{}", "records.json" to "{}", "files/test-id" to "original receipt"))
-            val result = ArchiveIO.extract(archive, directory)
+            val result = ArchiveIO.extract(archive, directory) { Long.MAX_VALUE }
             assertEquals(setOf("manifest.json", "records.json", "files/test-id"), result.keys)
             assertEquals("original receipt", result.getValue("files/test-id").readText())
             write(archive, mapOf("files/../../outside" to "malicious"))
-            assertThrows(IllegalArgumentException::class.java) { ArchiveIO.extract(archive, directory) }
-            assertFalse(directory.parentFile.resolve("outside").exists())
+            assertThrows(IllegalArgumentException::class.java) { ArchiveIO.extract(archive, directory) { Long.MAX_VALUE } }
+            assertFalse(checkNotNull(directory.parentFile).resolve("outside").exists())
         } finally { directory.deleteRecursively() }
     }
     @Test fun expandedEntryLimitIsEnforced() {
@@ -30,7 +30,7 @@ class ArchiveIOTest {
                 repeat(251) { zip.write(ByteArray(1024 * 1024)) }
                 zip.closeEntry()
             }
-            assertThrows(IllegalArgumentException::class.java) { ArchiveIO.extract(archive, directory) }
+            assertThrows(IllegalArgumentException::class.java) { ArchiveIO.extract(archive, directory) { Long.MAX_VALUE } }
         } finally { directory.deleteRecursively() }
     }
     @Test fun duplicateNamesAreRejectedEvenWhenZipIndexContainsBoth() {
@@ -50,7 +50,7 @@ class ArchiveIOTest {
             }
             assertEquals(2, occurrences)
             archive.writeBytes(bytes)
-            assertThrows(IllegalArgumentException::class.java) { ArchiveIO.extract(archive, directory) }
+            assertThrows(IllegalArgumentException::class.java) { ArchiveIO.extract(archive, directory) { Long.MAX_VALUE } }
         } finally { directory.deleteRecursively() }
     }
     @Test fun ledgerBeyondFormerThirtyTwoMiBLimitCanBeExtracted() {
@@ -63,7 +63,26 @@ class ArchiveIOTest {
                 repeat(33) { zip.write(chunk) }
                 zip.closeEntry()
             }
-            assertEquals(33L * 1024 * 1024, ArchiveIO.extract(archive, directory).getValue("records.json").length())
+            assertEquals(33L * 1024 * 1024, ArchiveIO.extract(archive, directory) { Long.MAX_VALUE }.getValue("records.json").length())
+        } finally { directory.deleteRecursively() }
+    }
+    @Test fun storageHeadroomIsCheckedBeforeEachEntryWithoutChangingTheOriginalArchive() {
+        val directory = Files.createTempDirectory("archive-capacity").toFile()
+        try {
+            val archive = File(directory, "archive.zip")
+            write(archive, linkedMapOf("manifest.json" to "{}", "files/test-id" to "receipt"))
+            val original = archive.readBytes()
+            var checks = 0
+            assertThrows(IllegalArgumentException::class.java) {
+                ArchiveIO.extract(archive, directory) {
+                    checks++
+                    if (checks == 1) Long.MAX_VALUE else 1024L * 1024 + 7
+                }
+            }
+            assertEquals(2, checks)
+            assertEquals("{}", File(directory, "entry-0").readText())
+            assertFalse(File(directory, "entry-1").exists())
+            assertArrayEquals(original, archive.readBytes())
         } finally { directory.deleteRecursively() }
     }
     private fun write(file: File, contents: Map<String, String>) = ZipOutputStream(file.outputStream()).use { zip ->

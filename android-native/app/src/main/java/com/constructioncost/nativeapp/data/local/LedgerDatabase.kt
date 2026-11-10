@@ -5,11 +5,26 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [ProjectEntity::class, BudgetEntity::class, ClassificationEntity::class, VendorEntity::class, CommitmentEntity::class, InstalmentEntity::class, ExpenseEntity::class, ExpenseLineEntity::class, ClassificationAllocationEntity::class, PlannedClassificationEntity::class, PaymentEntity::class, PaymentAllocationEntity::class, AttachmentEntity::class, ActivityEntity::class, AttachmentLinkEntity::class, ReminderEntity::class, AuditEntity::class, ImportEntity::class], version = 4, exportSchema = true)
+@Database(entities = [ProjectEntity::class, ProjectDeletionEntity::class, BudgetEntity::class, ClassificationEntity::class, VendorEntity::class, CommitmentEntity::class, InstalmentEntity::class, ExpenseEntity::class, ExpenseLineEntity::class, ClassificationAllocationEntity::class, PlannedClassificationEntity::class, PaymentEntity::class, PaymentAllocationEntity::class, AttachmentEntity::class, ActivityEntity::class, AttachmentLinkEntity::class, ReminderEntity::class, AuditEntity::class, ImportEntity::class], version = 6, exportSchema = true)
 internal abstract class LedgerDatabase : RoomDatabase() {
     abstract fun reads(): LedgerDao
 
     companion object {
+        val DURABILITY_CALLBACK = object : RoomDatabase.Callback() {
+            override fun onOpen(db: SupportSQLiteDatabase) { db.execSQL("PRAGMA synchronous=FULL") }
+        }
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE commitments ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE commitments ADD COLUMN calculationJson TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE instalments ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+            }
+        }
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS project_deletions (projectId TEXT NOT NULL PRIMARY KEY, phase TEXT NOT NULL, filesJson TEXT NOT NULL, startedAt INTEGER NOT NULL)")
+            }
+        }
         val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE expense_lines ADD COLUMN nature TEXT NOT NULL DEFAULT ''")

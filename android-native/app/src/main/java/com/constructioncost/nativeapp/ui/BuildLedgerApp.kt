@@ -1,36 +1,53 @@
 package com.constructioncost.nativeapp.ui
 
+import android.net.Uri
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.SavedStateHandle
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewmodel.CreationExtras
-import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.Preferences
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavHostController
+import androidx.navigation.NavController
+import androidx.navigation.NavOptionsBuilder
 import androidx.navigation.compose.*
+import com.constructioncost.nativeapp.data.local.LedgerRecoveryStateStore
 import com.constructioncost.nativeapp.data.repository.LedgerRepository
 import com.constructioncost.nativeapp.domain.*
 import com.constructioncost.nativeapp.platform.UiActions
-import java.time.LocalDate
 
-@OptIn(ExperimentalMaterial3Api::class)
+internal val webDestinations = listOf("home" to "Home", "entry" to "Add Entry", "activity" to "Activity", "documents" to "Files", "explore" to "Explore")
+
+internal fun NavController.navigateIfGraphReady(route: String, optionsBuilder: NavOptionsBuilder.() -> Unit): Boolean {
+    if (currentDestination == null) return false
+    navigate(route, optionsBuilder)
+    return true
+}
+
 @Composable
-fun BuildLedgerApp(repository: LedgerRepository, actions: UiActions, preferences: DataStore<Preferences>? = null) {
+fun BuildLedgerApp(repository: LedgerRepository, actions: UiActions, preferences: DataStore<Preferences>? = null,
+    onRecoveryDiagnostic: () -> Unit = {}, onRecoveryRetry: (() -> Unit)? = null) {
     val context = LocalContext.current.applicationContext
     AppUpdates()
     val vm: LedgerViewModel = viewModel(factory = remember(repository) {
@@ -41,126 +58,193 @@ fun BuildLedgerApp(repository: LedgerRepository, actions: UiActions, preferences
         }
     })
     val state by vm.state.collectAsStateWithLifecycle()
-    val projects by repository.projects.collectAsStateWithLifecycle(emptyList())
-    val nav = rememberNavController()
-    val route = nav.currentBackStackEntryAsState().value?.destination?.route.orEmpty()
-    val snackbar = remember { SnackbarHostState() }
-    var activityFilter by rememberSaveable(stateSaver = listSaver(
-        save = { listOf(it.query, it.fromDate, it.toDate, it.classificationId.orEmpty(), it.vendorId.orEmpty(), it.status, it.sort, it.directClassification.toString()) },
-        restore = { ExpenseFilter(it[0], it[1], it[2], it[3].ifBlank { null }, it[4].ifBlank { null }, it[5], it[6], it.getOrNull(7) == "true") }
-    )) { mutableStateOf(ExpenseFilter()) }
-    fun activity(filter: ExpenseFilter = ExpenseFilter()) { activityFilter = filter; nav.navigate("activity") { launchSingleTop = true } }
-    fun detail(id: String, type: String) { nav.navigate("detail/$type/$id") }
-    LaunchedEffect(state.message) {
-        state.message?.let { snackbar.showSnackbar(it); vm.dismissMessage() }
+    LaunchedEffect(repository) {
+        if (vm.state.value.recoveryRequired && !LedgerRecoveryStateStore(context).isRecoveryRequired()) vm.retryInitialization()
     }
-    MaterialTheme(colorScheme = lightColorScheme(
-        primary = Color(0xFF164A69), onPrimary = Color.White, secondary = Color(0xFF365D43),
-        background = Color(0xFFFAFCFE), surface = Color.White, onSurface = Color(0xFF16232B),
-        onBackground = Color(0xFF16232B), error = Color(0xFFAA2020)
-    )) {
-        Scaffold(snackbarHost = { SnackbarHost(snackbar) }, topBar = {
-            TopAppBar(title = {
-                Column {
-                    Text("BuildLedger", style = MaterialTheme.typography.titleLarge)
-                    Text(projects.firstOrNull { it.id == state.projectId }?.name ?: "Local construction ledger", style = MaterialTheme.typography.bodyMedium)
-                }
-            }, navigationIcon = {
-                if (route !in listOf("home", "entry", "activity", "insights", "more")) TextButton({ nav.popBackStack() }) { Text("Back") }
-            }, actions = { TextButton({ nav.navigate("projects") }) { Text("Project") } })
-        }, bottomBar = {
-            NavigationBar {
-                listOf("home" to "Home", "entry" to "Add Entry", "activity" to "Activity", "insights" to "Insights", "more" to "More").forEach { (target, label) ->
-                    NavigationBarItem(selected = route == target, onClick = {
-                        nav.navigate(target) {
-                            popUpTo("home") { saveState = true }
-                            launchSingleTop = true; restoreState = true
+    val projects = state.projects
+    val nav = rememberNavController()
+    val route = nav.currentBackStackEntryAsState().value?.destination?.route ?: "home"
+    var lastTab by rememberSaveable { mutableStateOf("home") }
+    LaunchedEffect(route) { if(route in webDestinations.map { it.first }) lastTab=route }
+    val activeTab = when { route in listOf("entry-form","allocate") -> "entry"; route == "calendar" -> "explore"; route in webDestinations.map { it.first } -> route; else -> lastTab }
+    val snackbar = remember { SnackbarHostState() }
+    var activityFilter by rememberSaveable(state.projectId, stateSaver = listSaver(
+        save = { listOf(it.query, it.fromDate, it.toDate, it.classificationId.orEmpty(), it.vendorId.orEmpty(), it.status, it.sort, it.directClassification.toString(), it.materialName.orEmpty(), it.missingVendor.toString(), it.postedOnly.toString(),it.costNature.orEmpty()) },
+        restore = { ExpenseFilter(it[0],it[1],it[2],it[3].ifBlank { null },it[4].ifBlank { null },it[5],it[6],it.getOrNull(7)=="true",it.getOrNull(8)?.ifBlank { null },it.getOrNull(9)=="true",it.getOrNull(10)=="true",it.getOrNull(11)?.ifBlank{null}) }
+    )) { mutableStateOf(ExpenseFilter()) }
+    fun navigate(target: String) {
+        if (!state.ready || state.recoveryRequired) return
+        val destination = if (!state.hasActiveProject && target !in listOf("projects", "backup", "settings")) "projects" else target
+        nav.navigateIfGraphReady(destination) {
+        if(destination in webDestinations.map{it.first}) {popUpTo("home"){saveState=true};restoreState=true}
+        launchSingleTop = true
+    } }
+    @Composable fun ProjectContent(content: @Composable () -> Unit) {
+        if (state.hasActiveProject) content() else ProjectsScreen(vm, actions)
+    }
+    fun activity(filter: ExpenseFilter = ExpenseFilter()) { activityFilter = filter; navigate("activity") }
+    fun detail(id: String, type: String) { navigate("detail/$type/${Uri.encode(id)}") }
+    LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); vm.dismissMessage() } }
+    WebTheme {
+        BoxWithConstraints(Modifier.fillMaxSize().background(Color.White)) {
+            val wide = maxWidth >= 760.dp
+            val railWidth = if(maxWidth<1100.dp) 190.dp else 222.dp
+            Row(Modifier.fillMaxSize()) {
+                if(wide) Surface(Modifier.width(railWidth).fillMaxHeight(), color=Color.White, border=BorderStroke(1.dp,WebColors.line)) {
+                    Column(Modifier.windowInsetsPadding(WindowInsets.statusBars).padding(horizontal=13.dp,vertical=24.dp)) {
+                        Row(Modifier.padding(11.dp).padding(bottom=24.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(11.dp)) {
+                            WebIcon("home",Modifier.size(34.dp))
+                            Column { Text("BuildLedger",fontSize=20.sp,fontWeight=FontWeight.ExtraBold);Text("Construction Manager",fontSize=11.sp,color=WebColors.muted) }
                         }
-                    }, icon = { Text(label.take(1), Modifier.clearAndSetSemantics {}) }, label = { Text(label) })
+                        webDestinations.forEach { (target,label) -> WebNavItem(target,label,activeTab==target,false) { navigate(target) } }
+                        Spacer(Modifier.weight(1f))
+                        Text("●  Stored on this device",color=WebColors.teal,fontSize=12.sp,fontWeight=FontWeight.SemiBold)
+                        Text("Private, offline-first\nBack up your project regularly.",Modifier.padding(top=9.dp),fontSize=12.sp,color=WebColors.muted)
+                    }
                 }
-            }
-        }) { padding ->
-            Column(Modifier.fillMaxSize().padding(padding)) {
-                if (!state.ready) {
-                    LinearProgressIndicator(Modifier.fillMaxWidth())
-                    Text("Opening local ledger…", Modifier.padding(16.dp))
-                } else if (state.projectId.isBlank()) {
-                    Text(state.error ?: "No local project is available.", Modifier.padding(16.dp))
-                    Button({ nav.navigate("projects") }, Modifier.padding(16.dp)) { Text("Create project") }
-                } else {
-                    if (state.error != null && route != "entry") Text(state.error.orEmpty(), Modifier.padding(12.dp), color = MaterialTheme.colorScheme.error)
-                    NavHost(nav, "home", Modifier.weight(1f)) {
-                        composable("home") { HomeScreen(vm, { activity(it) }, ::detail, { nav.navigate(it) }) }
-                        composable("entry") { EntryScreen(vm, actions, { activity() }, { nav.navigate("payments") }) }
-                        composable("activity") { ActivityScreen(vm, activityFilter, { activityFilter = it }, ::detail, actions) }
-                        composable("insights") { InsightsScreen(vm, { activity(it) }) }
-                        composable("more") { MoreScreen { nav.navigate(it) } }
-                        composable("payments") { PaymentsScreen(vm, { nav.navigate("entry") }, ::detail) }
-                        composable("calendar") { CalendarScreen(vm, { nav.navigate("entry") }, ::detail) }
-                        composable("documents") { DocumentsScreen(vm, actions, ::detail) }
-                        composable("vendors") { VendorsScreen(vm, { activity(it) }, ::detail) }
-                        composable("projects") { ProjectsScreen(vm) }
-                        composable("categories") { CategoriesScreen(vm) }
-                        composable("backup") { BackupScreen(vm, actions) }
-                        composable("settings") { SettingsScreen(vm, actions) }
-                        composable("detail/{type}/{id}") { entry ->
-                            DetailScreen(vm, entry.arguments?.getString("id").orEmpty(), entry.arguments?.getString("type").orEmpty(),
-                                actions, { nav.navigate("entry") }, ::detail)
+                Scaffold(Modifier.weight(1f),containerColor=WebColors.background,
+                    snackbarHost={ SnackbarHost(snackbar) },
+                    topBar={
+                        Surface(color=WebColors.header) {
+                            Column(Modifier.windowInsetsPadding(WindowInsets.statusBars)) {
+                                Row(Modifier.fillMaxWidth().heightIn(min=76.dp).padding(horizontal=if(wide) 40.dp else 16.dp,vertical=14.dp),
+                                    verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
+                                    if(route in listOf("entry-form","allocate","payments","vendors","projects")) IconButton({ nav.popBackStack() }) { WebIcon("back",Modifier.semanticsLabel("Back")) }
+                                    val projectName = projects.firstOrNull { it.id==state.projectId && !it.archived }?.name ?: if (state.ready) "No project selected" else "Loading project"
+                                    TextButton({ navigate("projects") }, Modifier.weight(1f).semantics { contentDescription = "Select project. Current project: $projectName" }) {
+                                        Column(Modifier.fillMaxWidth(),verticalArrangement=Arrangement.spacedBy(2.dp)) {
+                                            Text("PROJECT",fontSize=10.sp,letterSpacing=1.3.sp,fontWeight=FontWeight.Bold,color=WebColors.muted)
+                                            Text(projectName,fontSize=14.sp,fontWeight=FontWeight.SemiBold)
+                                        }
+                                    }
+                                    WebHeaderButton("backup","Backup and restore") { navigate("backup") }
+                                    WebHeaderButton("settings","Project settings") { navigate("settings") }
+                                }
+                                HorizontalDivider(color=WebColors.line)
+                            }
+                        }
+                    },
+                    bottomBar={ if(!wide) Surface(color=WebColors.header) {
+                        Column {
+                            HorizontalDivider(color=WebColors.line)
+                            Row(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.navigationBars).padding(horizontal=3.dp,vertical=6.dp)) {
+                                webDestinations.forEach { (target,label) -> Box(Modifier.weight(1f)) { WebNavItem(target,label,activeTab==target,true) { navigate(target) } } }
+                            }
+                        }
+                    } }) { padding ->
+                    Column(Modifier.fillMaxSize().padding(padding)) {
+                        if (state.recoveryState == com.constructioncost.nativeapp.data.local.LedgerRecoveryState.PREFERENCES_UNAVAILABLE) {
+                            Text(state.error ?: "Preferences are unavailable. Unsaved drafts and settings may be lost when the app closes.",
+                                Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = MaterialTheme.colorScheme.error)
+                            TextButton(vm::retryPreferences, Modifier.padding(horizontal = 8.dp)) { Text("Retry saving preferences") }
+                        }
+                        Box(Modifier.weight(1f)) {
+                        when {
+                            state.recoveryRequired -> RecoveryScreen(LedgerRecoveryStateStore(context).state(),state.error,onRecoveryRetry ?: vm::retryInitialization,actions.restoreBackup,onRecoveryDiagnostic)
+                            !state.ready -> StartupScreen()
+                            else -> NavHost(nav,startDestination="home") {
+                                composable("home") { ProjectContent { key(state.projectId) { WebHomeScreen(vm,::activity,::detail,::navigate) } } }
+                                composable("entry") { ProjectContent { EntryChoices(vm) { kind -> if(kind=="Allocate advance") navigate("allocate") else navigate("entry-form") } } }
+                                composable("allocate") { ProjectContent { PaymentsScreen(vm,{navigate("entry-form")},::detail,allocationOnly=true) } }
+                                composable("entry-form") { ProjectContent { EntryScreen(vm,actions,{ activity() },{ navigate("payments") }) } }
+                                composable("activity") { ProjectContent { key(state.projectId) { WebActivityScreen(vm,activityFilter,{ activityFilter=it },::detail,actions) } } }
+                                composable("documents") { ProjectContent { key(state.projectId) { DocumentsScreen(vm,actions,::detail) { navigate("backup") } } } }
+                                composable("explore") { ProjectContent { key(state.projectId) { WebExploreScreen(vm,::activity,::detail,::navigate,enableReminders={actions.setReminders(true)}) } } }
+                                composable("payments") { ProjectContent { PaymentsScreen(vm,{ navigate("entry-form") },::detail) } }
+                                composable("calendar") { ProjectContent { WebExploreScreen(vm,::activity,::detail,::navigate,"calendar") {actions.setReminders(true)} } }
+                                dialog("categories",dialogProperties=DialogProperties(usePlatformDefaultWidth=false)) { NativeModal("Categories",{nav.popBackStack()}) { ProjectContent { CategoriesScreen(vm) } } }
+                                composable("vendors") { ProjectContent { key(state.projectId) { VendorsScreen(vm,::activity,::detail) } } }
+                                composable("projects") { ProjectsScreen(vm,actions) }
+                                dialog("backup",dialogProperties=DialogProperties(usePlatformDefaultWidth=false)) { NativeModal("Backup & Restore",{nav.popBackStack()}) {
+                                    BackupScreen(vm,actions.copy(restoreBackup={ password -> nav.popBackStack(); actions.restoreBackup(password) }))
+                                } }
+                                dialog("settings",dialogProperties=DialogProperties(usePlatformDefaultWidth=false)) { key(state.projectId) { NativeModal("Project settings",{nav.popBackStack()}) {
+                                    SettingsScreen(vm,actions,{navigate("projects")},{navigate("vendors")})
+                                } } }
+                                dialog("detail/{type}/{id}",dialogProperties=DialogProperties(usePlatformDefaultWidth=false)) { entry -> ProjectContent { key(state.projectId) {
+                                    NativeModal(when(entry.arguments?.getString("type")){"DOCUMENT"->"Document details";"EXPENSE"->"Bill details";"PAYMENT"->"Payment details";"INSTALMENT"->"Planned payment";"COMMITMENT"->"Contract details";else->"Entry details"},{nav.popBackStack()}) {
+                                        DetailScreen(vm,entry.arguments?.getString("id").orEmpty(),entry.arguments?.getString("type").orEmpty(),actions,{ navigate("entry-form") },::detail,showTitle=false,onDeleted={nav.popBackStack()})
+                                    }
+                                } } }
+                            }
+                        }
                         }
                     }
                 }
             }
         }
+        if (state.pendingDraftReplacement) AlertDialog(onDismissRequest = vm::cancelDraftReplacement,
+            title = { Text("Discard current draft?") },
+            text = { Text("The current entry has unsaved changes. Start another entry?") },
+            confirmButton = { TextButton(vm::confirmDraftReplacement) { Text("Discard current draft") } },
+            dismissButton = { TextButton(vm::cancelDraftReplacement) { Text("Cancel") } })
+        state.actionError?.let { message -> AlertDialog(onDismissRequest = vm::dismissActionError,
+            title = { Text("Action failed") }, text = { Text(message) },
+            confirmButton = { TextButton(vm::dismissActionError) { Text("OK") } }) }
     }
 }
 
 @Composable
-private fun HomeScreen(vm: LedgerViewModel, activity: (ExpenseFilter) -> Unit, detail: (String, String) -> Unit, navigate: (String) -> Unit) {
-    val state by vm.state.collectAsStateWithLifecycle()
-    val project = state.projectId
-    val summary by remember(project) { vm.repository.summary(project) }.collectAsStateWithLifecycle(LedgerSummary())
-    val expenses by remember(project) { vm.repository.expenses(project, ExpenseFilter(status = "OUTSTANDING", sort = "AMOUNT_DESC"), 6) }.collectAsStateWithLifecycle(emptyList())
-    val plans by remember(project) { vm.repository.instalments(project) }.collectAsStateWithLifecycle(emptyList())
-    val recent by remember(project) { vm.repository.activity(project, 6, sortByRecordedTime = true) }.collectAsStateWithLifecycle(emptyList())
-    val stages by remember(project) { vm.repository.insights(project, dimension = "WORK") }.collectAsStateWithLifecycle(emptyList())
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), contentPadding = PaddingValues(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { Title("Home") }
-        item { RecordCard("Recorded cost", "Costs already incurred", Money.format(summary.recordedPaise)) { activity(ExpenseFilter()) } }
-        item { RecordCard("Cash paid", "Payments less reversals and refunds", Money.format(summary.paidPaise)) { navigate("payments") } }
-        item { RecordCard("Outstanding", "Unpaid incurred costs", Money.format(summary.outstandingPaise)) { activity(ExpenseFilter(status = "OUTSTANDING")) } }
-        item { RecordCard("Upcoming 30 days", "Future schedules; separate from costs", Money.format(summary.upcomingPaise)) { navigate("payments") } }
-        item {
-            val budget = summary.budgetPaise
-            RecordCard("Budget", if (budget == null) "Not set · choose a project budget" else
-                "${if (summary.recordedPaise <= budget) "Remaining" else "Over budget"}: ${Money.format(kotlin.math.abs(budget - summary.recordedPaise))}",
-                budget?.let(Money::format)) { navigate("projects") }
+private fun NativeModal(title:String,close:()->Unit,content:@Composable ()->Unit) {
+    Surface(Modifier.fillMaxWidth(.94f).widthIn(max=980.dp).fillMaxHeight(.91f).imePadding(),shape=RoundedCornerShape(14.dp),color=Color.White) {
+        Column {
+            Row(Modifier.fillMaxWidth().padding(start=20.dp,end=8.dp,top=8.dp,bottom=4.dp),verticalAlignment=Alignment.CenterVertically) {
+                Text(title,Modifier.weight(1f),style=MaterialTheme.typography.titleLarge)
+                IconButton(close,Modifier.semanticsLabel("Close")) {Text("×",fontSize=28.sp,color=WebColors.muted)}
+            }
+            Box(Modifier.weight(1f)) {content()}
         }
-        if (summary.advancePaise > 0) item { RecordCard("Available advances", "Apply existing cash to unpaid expenses", Money.format(summary.advancePaise)) { navigate("payments") } }
-        item { RecordCard("Agreed commitments", "Future agreements; excluded from recorded cost", Money.format(summary.commitmentPaise)) { navigate("payments") } }
-        if (stages.any { it.id == null && it.amountPaise > 0 }) item {
-            RecordCard("Review unclassified costs", "Unclassified costs stay included in totals") { activity(ExpenseFilter(status = "UNCLASSIFIED_WORK")) }
-        }
-        item { Title("Payments to watch") }
-        items(plans.filter { !it.cancelled && it.outstandingPaise > 0 }.sortedBy { it.dueDate }.take(6), key = { "plan-${it.id}" }) { plan ->
-            RecordCard(plan.title, "${if (plan.dueDate < LocalDate.now().toString()) "Overdue · " else ""}${plan.dueDate}", Money.format(plan.outstandingPaise)) { detail(plan.id, "INSTALMENT") }
-        }
-        items(expenses, key = { "expense-${it.id}" }) { expense -> RecordCard(expense.description, "${expense.vendorName} · unpaid", Money.format(expense.outstandingPaise)) { detail(expense.id, "EXPENSE") } }
-        item { Title("Work stages") }
-        items(stages.take(8), key = { it.id ?: "unclassified" }) { stage ->
-            RecordCard(stage.name, "${stage.expenseCount} expenses", Money.format(stage.amountPaise)) { activity(ExpenseFilter(classificationId = stage.id, status = if (stage.id == null) "UNCLASSIFIED_WORK" else "ALL")) }
-        }
-        item { Title("Recent activity") }
-        items(recent, key = { "${it.type}-${it.id}" }) { row -> RecordCard(row.title, "${row.type} · ${row.date}", row.amountPaise?.let(Money::format)) { detail(row.id, if (row.type == "ATTACHMENT") "DOCUMENT" else row.type) } }
-        if (recent.isEmpty()) item { Text("Your ledger is empty. Record a three-field expense in Add Entry.") }
+    }
+}
+
+private fun Modifier.semanticsLabel(label: String) = this.then(Modifier.semantics { contentDescription=label })
+
+@Composable
+private fun WebHeaderButton(icon: String,label: String,click: () -> Unit) {
+    Surface(onClick=click,modifier=Modifier.size(43.dp).semanticsLabel(label),shape=RoundedCornerShape(12.dp),color=Color.White,border=BorderStroke(1.dp,Color(0xFFD1DFEF))) {
+        Box(contentAlignment=Alignment.Center) { WebIcon(icon,tint=WebColors.ink) }
     }
 }
 
 @Composable
-private fun MoreScreen(navigate: (String) -> Unit) {
-    LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { Title("More") }
-        items(listOf("payments" to "Payments and schedules", "calendar" to "Calendar", "documents" to "Documents", "vendors" to "Vendors", "projects" to "Projects", "categories" to "Categories", "backup" to "Backup and recovery", "settings" to "Local settings")) { (route, title) ->
-            RecordCard(title, "Open $title") { navigate(route) }
+private fun WebNavItem(target: String,label: String,selected: Boolean,compact: Boolean,click: () -> Unit) {
+    Surface(onClick=click,modifier=Modifier.fillMaxWidth().padding(1.dp),shape=RoundedCornerShape(if(compact) 8.dp else 12.dp),
+        color=if(selected) WebColors.blueSoft else WebColors.header,contentColor=if(selected) WebColors.blue else WebColors.muted) {
+        if(compact) Column(Modifier.padding(vertical=9.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.spacedBy(5.dp)) {
+            WebIcon(target,Modifier.size(21.dp),if(selected) WebColors.blue else WebColors.muted)
+            Text(label,fontSize=10.sp,fontWeight=FontWeight.SemiBold,maxLines=1)
+        } else Row(Modifier.padding(horizontal=15.dp,vertical=14.dp),verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(14.dp)) {
+            WebIcon(target,tint=if(selected) WebColors.blue else WebColors.muted);Text(label,fontWeight=FontWeight.SemiBold)
         }
+    }
+}
+
+internal data class EntryChoice(val kind: String,val icon: String,val title: String,val description: String)
+internal val webEntryChoices = listOf(
+    EntryChoice("Purchase","purchase","Bought materials","Enter the total directly or calculate by quantity"),
+    EntryChoice("Payment","money","Paid someone","Bill settlement or supplier advance"),
+    EntryChoice("Labour","labour","Labour or work","Wages, contractor or service"),
+    EntryChoice("Other cost","other","Other expense","Transport, fees, hire, utilities"),
+    EntryChoice("Received bill","file","Received a bill","Record now, pay later"),
+    EntryChoice("Plan","calendar","Plan a payment","Instalment, due date, reminder"),
+    EntryChoice("Contract","contract","Contract & instalments","Engineer and contractor agreements"),
+    EntryChoice("Allocate advance","allocate","Apply an advance","Use existing advance on a bill"),
+    EntryChoice("Work log","time","Work log / timer","Site visit, notes, clocked time"))
+
+@Composable
+private fun EntryChoices(vm: LedgerViewModel,open: (String) -> Unit) {
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal=16.dp),contentPadding=PaddingValues(vertical=24.dp),verticalArrangement=Arrangement.spacedBy(12.dp)) {
+        item { PageHeading("Add Entry","Choose what happened. Only the relevant fields will appear.") }
+        items(webEntryChoices.chunked(2)) { pair -> Row(horizontalArrangement=Arrangement.spacedBy(10.dp),modifier=Modifier.height(IntrinsicSize.Max)) {
+            pair.forEach { choice -> Surface(onClick={ vm.openNewEntry(choice.kind) { open(choice.kind) } },modifier=Modifier.weight(1f).fillMaxHeight(),shape=RoundedCornerShape(12.dp),color=Color.White,border=BorderStroke(1.dp,WebColors.line)) {
+                Column(Modifier.padding(16.dp).heightIn(min=if(choice.description.length>35) 116.dp else 98.dp),verticalArrangement=Arrangement.spacedBy(9.dp)) {
+                    WebIcon(choice.icon,Modifier.size(18.dp))
+                    Text(choice.title,fontSize=14.sp,fontWeight=FontWeight.Bold)
+                    Text(choice.description,color=WebColors.muted,fontSize=13.sp,lineHeight=19.sp)
+                }
+            } }
+            if(pair.size==1) Spacer(Modifier.weight(1f))
+        } }
+        item { WebCard(color=WebColors.soft) { Text("Keeping figures correct:",fontWeight=FontWeight.Bold);Text("A new bill records a cost. A payment records money leaving. A planned instalment is not money paid. The application keeps them separate.",color=WebColors.muted) } }
     }
 }

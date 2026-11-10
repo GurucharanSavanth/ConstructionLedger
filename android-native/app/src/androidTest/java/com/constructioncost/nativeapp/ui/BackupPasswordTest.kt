@@ -4,12 +4,15 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.hasScrollToNodeAction
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.performScrollToNode
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.constructioncost.nativeapp.data.repository.LedgerRepository
@@ -50,18 +53,23 @@ class BackupPasswordTest {
                     preferences.preferences.store) as T
         })[LedgerViewModel::class.java]
         compose.setContent { BackupScreen(model, actions) }
+        fun chooseExport() {
+            compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Choose legacy export"))
+            compose.onNodeWithText("Choose legacy export").performClick()
+        }
         compose.onNodeWithTag("legacyRecoveryPassword").performTextInput("short")
-        compose.onNodeWithText("Choose legacy export").performClick()
+        chooseExport()
         assertEquals(emptyList<String>(), captured)
+        compose.onNodeWithText("Enter at least 10 characters.").assertExists()
 
         compose.onNodeWithTag("legacyRecoveryPassword").performTextClearance()
         compose.onNodeWithTag("legacyRecoveryPassword").performTextInput("correct-handoff")
-        compose.onNodeWithText("Choose legacy export").performClick()
+        chooseExport()
         assertEquals(listOf("correct-handoff"), captured)
         assertNotEquals("default-project", captured.single())
 
         compose.onNodeWithTag("legacyRecoveryPassword").performTextInput("second-handoff")
-        compose.onNodeWithText("Choose legacy export").performClick()
+        chooseExport()
         assertEquals(listOf("correct-handoff", "second-handoff"), captured)
     }
 }

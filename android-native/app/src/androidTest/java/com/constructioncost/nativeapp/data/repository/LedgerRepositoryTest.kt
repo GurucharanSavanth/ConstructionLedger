@@ -34,6 +34,97 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class LedgerRepositoryTest {
+    @Test fun attachmentLinksKeepTheirIdentityAndAuditActualRemovals() = runBlocking<Unit> {
+        val repository = LedgerRepository.inMemory(InstrumentationRegistry.getInstrumentation().targetContext)
+        try {
+            repository.saveProject(ProjectInfo("project", "Build"))
+            listOf("kept", "removed", "note-file").forEach { id ->
+                repository.insertAttachment(AttachmentInfo(id, "project", "$id.txt", "text/plain", 1, "a".repeat(64), "$id.bin", 1))
+            }
+            val bill = ExpenseInput(id = "bill", projectId = "project", description = "Material", amountPaise = 10_000,
+                date = "2026-01-01", attachmentIds = listOf("kept", "removed"))
+            repository.saveExpense(bill)
+            val linksBefore = repository.exportRecords().getJSONArray("attachment_links")
+            val keptLinkId = (0 until linksBefore.length()).map { linksBefore.getJSONObject(it) }
+                .single { it.getString("attachmentId") == "kept" }.getString("id")
+            repository.saveExpense(bill.copy(revision = 0))
+            val unchanged = repository.exportRecords().getJSONArray("attachment_links")
+            assertEquals(keptLinkId, (0 until unchanged.length()).map { unchanged.getJSONObject(it) }
+                .single { it.getString("attachmentId") == "kept" }.getString("id"))
+            assertEquals(0, repository.audits("kept", "attachments", "project").first().count { it.action == "UNLINK" })
+            repository.saveExpense(bill.copy(revision = 1, attachmentIds = listOf("kept")))
+            assertEquals(keptLinkId, repository.exportRecords().getJSONArray("attachment_links").getJSONObject(0).getString("id"))
+            val billRemoval = repository.audits("removed", "attachments", "project").first().single { it.action == "UNLINK" }
+            assertEquals(true, billRemoval.beforeJson.contains("\"targetId\":\"bill\""))
+            assertEquals(0, repository.attachment("removed")!!.referenceCount)
+            repository.saveNote(ActivityNote("note", "project", "Site", "2026-01-01", ""))
+            repository.linkAttachment("note-file", noteId = "note")
+            repository.deleteNote("note", 0)
+            assertEquals(1, repository.audits("note-file", "attachments", "project").first().count { it.action == "UNLINK" })
+            assertEquals(0, repository.attachment("note-file")!!.referenceCount)
+            repository.validateRecords(repository.exportRecords())
+        } finally { repository.close() }
+    }
+
+    @Test fun deletingRefundedBillPreservesCorrectionEvidenceAndReleasesNetAdvance() = runBlocking<Unit> {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val name = "refund-delete-${UUID.randomUUID()}.db"
+        fun open() = LedgerRepository(Room.databaseBuilder(context, LedgerDatabase::class.java, name).build(), context)
+        var repository = open()
+        val restored = LedgerRepository.inMemory(context)
+        try {
+            repository.saveProject(ProjectInfo("project", "Build"))
+            repository.saveExpense(ExpenseInput(id = "bill", projectId = "project", description = "Material", amountPaise = 10_000, date = "2026-01-01"))
+            repository.savePayment(PaymentInput(id = "cash", projectId = "project", amountPaise = 10_000, date = "2026-01-01",
+                allocations = listOf(PaymentAllocationInput("bill", 10_000))))
+            repository.refundPayment("cash", 1_000, "Returned", "2026-01-02")
+            repository.deleteExpense("bill", 0)
+            val summary = repository.summary("project").first()
+            assertEquals(0L, summary.recordedPaise)
+            assertEquals(9_000L, summary.paidPaise)
+            assertEquals(0L, summary.outstandingPaise)
+            assertEquals(9_000L, summary.advancePaise)
+            val snapshot = repository.exportRecords()
+            val allocations = snapshot.getJSONArray("payment_allocations")
+            assertEquals(2, allocations.length())
+            assertEquals(2_000L, (0 until allocations.length()).sumOf { allocations.getJSONObject(it).getLong("amountPaise") })
+            val audit = snapshot.getJSONArray("audit_records")
+            assertEquals(true, (0 until audit.length()).any {
+                val event = audit.getJSONObject(it)
+                event.getString("recordType") == "payment_allocations" && event.getString("action") == "RELEASE"
+            })
+            repository.close()
+            repository = open()
+            assertEquals(9_000L, repository.summary("project").first().advancePaise)
+            repository.validateRecords(snapshot)
+            restored.replaceRecords(snapshot)
+            assertEquals(9_000L, restored.summary("project").first().advancePaise)
+            restored.reversePayment("cash", "Remaining returned", "2026-01-03")
+            restored.validateRecords(restored.exportRecords())
+            assertEquals(0L, restored.summary("project").first().paidPaise)
+            assertEquals(0L, restored.summary("project").first().advancePaise)
+        } finally { repository.close(); restored.close(); context.deleteDatabase(name) }
+    }
+
+    @Test fun publicFileReplacementUsesOnePrivateValidatedCopy() = runBlocking<Unit> {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val source = LedgerRepository.inMemory(context)
+        val restored = LedgerRepository.inMemory(context)
+        val file = File.createTempFile("ledger-caller-", ".json", context.cacheDir)
+        try {
+            source.saveProject(ProjectInfo("project", "Build"))
+            source.saveExpense(ExpenseInput(id = "bill", projectId = "project", description = "Material", amountPaise = 10_000, date = "2026-01-01"))
+            source.exportRecordsTo(file)
+            val validated = file.readBytes()
+            restored.replacementCheckpoint = { phase -> if (phase == "rows-cleared") file.writeText("{}") }
+            restored.replaceRecordsFile(file, LedgerRepository.SNAPSHOT_VERSION)
+            assertEquals(10_000L, restored.summary("project").first().recordedPaise)
+            assertEquals("{}", file.readText())
+            assertEquals(true, validated.isNotEmpty())
+            restored.validateRecords(restored.exportRecords())
+        } finally { restored.replacementCheckpoint = {}; source.close(); restored.close(); file.delete() }
+    }
+
     @Test fun restoreCannotResurrectRemovedCostsAgreementsOrSchedulesFromStaleEditors() = runBlocking<Unit> {
         val repository = LedgerRepository.inMemory(InstrumentationRegistry.getInstrumentation().targetContext)
         try {
@@ -94,6 +185,10 @@ class LedgerRepositoryTest {
             repository.forEachExportRow("B") { table, row -> if (table == "audit_records" && row.getString("recordType") == "payment_allocations") b += row.toString() }
             assertEquals(2, a.size)
             assertEquals(0, b.size)
+            val correctionId = "allocation-correction:correction-owner-test"
+            assertEquals(true, repository.projectAudits("A").first().any { it.id == correctionId })
+            assertEquals(false, repository.projectAudits("B").first().any { it.id == correctionId })
+            assertEquals(true, repository.journal("A", ExpenseFilter()).first().any { it.event.id == correctionId })
             assertEquals(50L, repository.summary("A").first().outstandingPaise)
             assertEquals(100L, repository.summary("A").first().paidPaise)
         } finally { repository.close() }
@@ -345,8 +440,8 @@ class LedgerRepositoryTest {
             val sql = database.openHelper.writableDatabase
             sql.execSQL("DELETE FROM payment_allocations WHERE id=?", arrayOf(old.allocationId))
             sql.execSQL("INSERT INTO payment_allocations(id,paymentId,expenseId,amountPaise) VALUES('shared','payment-b','expense-b',100)")
-            sql.execSQL("INSERT INTO audit_records(id,recordType,recordId,action,beforeJson,afterJson,createdAt) VALUES(?,?,?,?,?,?,?)", arrayOf("allocation-correction:operation-a", "payment_allocations", "shared", "CORRECT", "null", "null", 3L))
-            sql.execSQL("INSERT INTO audit_records(id,recordType,recordId,action,beforeJson,afterJson,createdAt) VALUES(?,?,?,?,?,?,?)", arrayOf("row-b-delete", "payment_allocations", "shared", "DELETE", "null", "null", 4L))
+            sql.execSQL("INSERT INTO audit_records(id,recordType,recordId,action,beforeJson,afterJson,createdAt) VALUES(?,?,?,?,?,?,?)", arrayOf<Any?>("allocation-correction:operation-a", "payment_allocations", "shared", "CORRECT", "null", "null", 3L))
+            sql.execSQL("INSERT INTO audit_records(id,recordType,recordId,action,beforeJson,afterJson,createdAt) VALUES(?,?,?,?,?,?,?)", arrayOf<Any?>("row-b-delete", "payment_allocations", "shared", "DELETE", "null", "null", 4L))
             fun exportAuditIds(projectId: String): Set<String> {
                 val ids = mutableSetOf<String>()
                 runBlocking { repository.forEachExportRow(projectId) { table, row -> if (table == "audit_records") ids += row.getString("id") } }
@@ -460,9 +555,9 @@ class LedgerRepositoryTest {
             val sql = database.openHelper.writableDatabase
             sql.execSQL("INSERT INTO planned_classifications(id,classificationId,commitmentId,instalmentId) VALUES('shared','class-b-extra',NULL,'shared')")
             sql.execSQL("INSERT INTO audit_records(id,recordType,recordId,action,beforeJson,afterJson,createdAt) VALUES(?,?,?,?,?,?,?)",
-                arrayOf("legacy-ambiguous", "planned_classifications", "shared", "REPLACE", "{\"rows\":[]}", "{\"rows\":[]}", 2L))
+                arrayOf<Any?>("legacy-ambiguous", "planned_classifications", "shared", "REPLACE", "{\"rows\":[]}", "{\"rows\":[]}", 2L))
             sql.execSQL("INSERT INTO audit_records(id,recordType,recordId,action,beforeJson,afterJson,createdAt) VALUES(?,?,?,?,?,?,?)",
-                arrayOf("actual-child", "planned_classifications", "shared", "CREATE", "null", "null", 3L))
+                arrayOf<Any?>("actual-child", "planned_classifications", "shared", "CREATE", "null", "null", 3L))
             fun exported(projectId: String): List<org.json.JSONObject> {
                 val audits = mutableListOf<org.json.JSONObject>()
                 runBlocking { repository.forEachExportRow(projectId) { table, row -> if (table == "audit_records") audits += row } }
@@ -546,7 +641,7 @@ class LedgerRepositoryTest {
             repository.saveExpense(ExpenseInput(id = "line", projectId = "other", description = "Other invoice", amountPaise = 100, date = "2026-01-01", lines = listOf(ExpenseLineInput(id = "invoice", description = "Other material", amountPaise = 100))))
             repository.insertAttachment(AttachmentInfo("document-v1", "project", "Old drawing", "application/pdf", 1, "a".repeat(64), "old.pdf", 1, category = "Drawing"))
             database.openHelper.writableDatabase.execSQL("INSERT INTO audit_records(id,recordType,recordId,action,beforeJson,afterJson,createdAt) VALUES(?,?,?,?,?,?,?)",
-                arrayOf("child-audit", "expense_lines", "invoice", "CREATE", "null", "null", 2L))
+                arrayOf<Any?>("child-audit", "expense_lines", "invoice", "CREATE", "null", "null", 2L))
             val old = repository.exportRecords().apply {
                 remove("planned_classifications")
                 getJSONArray("expenses").also { rows -> for (index in 0 until rows.length()) rows.getJSONObject(index).remove("invoiceNumber") }
@@ -629,6 +724,40 @@ class LedgerRepositoryTest {
             invalid.getJSONArray("planned_classifications").getJSONObject(0).put("classificationId", "foreign")
             assertThrows(IllegalArgumentException::class.java) { runBlocking { repository.replaceRecords(invalid) } }
             assertEquals(listOf("stage"), repository.plannedClassifications("COMMITMENT", "agreement"))
+        } finally { repository.close() }
+    }
+
+    @Test fun plannedInsightsShowRemainingScheduleBalanceAndHideSettledOrCancelledRows() = runBlocking {
+        val repository = LedgerRepository.inMemory(InstrumentationRegistry.getInstrumentation().targetContext)
+        try {
+            repository.saveProject(ProjectInfo("project", "Build"))
+            repository.saveCommitment(CommitmentInput(id = "agreement", projectId = "project", title = "Agreement", amountPaise = 40_000, date = "2026-01-01", schedules = listOf(
+                InstalmentInput(id = "partial", projectId = "project", title = "Partial", amountPaise = 10_000, dueDate = "2026-02-01"),
+                InstalmentInput(id = "settled", projectId = "project", title = "Settled", amountPaise = 10_000, dueDate = "2026-02-02"),
+                InstalmentInput(id = "cancelled", projectId = "project", title = "Cancelled", amountPaise = 10_000, dueDate = "2026-02-03"),
+                InstalmentInput(id = "remaining", projectId = "project", title = "Remaining", amountPaise = 10_000, dueDate = "2026-02-04")
+            )))
+            repository.savePayment(PaymentInput(id = "partial-payment", projectId = "project", amountPaise = 4_000, date = "2026-01-02", instalmentId = "partial"))
+            repository.savePayment(PaymentInput(id = "full-payment", projectId = "project", amountPaise = 10_000, date = "2026-01-02", instalmentId = "settled"))
+            repository.cancelInstalment("cancelled", 0)
+            val rows = repository.plannedInsights("project").first()
+            assertEquals(6_000L, rows.single { it.id == "partial" }.amountPaise)
+            assertEquals(setOf("partial", "remaining", "agreement"), rows.map { it.id }.toSet())
+            assertEquals(40_000L, rows.single { it.type == "COMMITMENT" }.amountPaise)
+        } finally { repository.close() }
+    }
+
+    @Test fun calendarDayCountsTrackEventsAndStayProjectScoped() = runBlocking {
+        val repository = LedgerRepository.inMemory(InstrumentationRegistry.getInstrumentation().targetContext)
+        try {
+            repository.saveProject(ProjectInfo("project", "Build"))
+            repository.saveProject(ProjectInfo("other", "Other"))
+            repository.saveExpense(ExpenseInput(id = "expense", projectId = "project", description = "Cost", amountPaise = 100, date = "2026-03-04"))
+            repository.saveInstalment(InstalmentInput(id = "plan", projectId = "project", title = "Due", amountPaise = 1_000, dueDate = "2026-03-04"))
+            repository.saveExpense(ExpenseInput(id = "foreign", projectId = "other", description = "Foreign", amountPaise = 100, date = "2026-03-04"))
+            assertEquals(2, repository.calendarDayCounts("project", "2026-03-01", "2026-03-31").first().single().eventCount)
+            repository.savePayment(PaymentInput(id = "payment", projectId = "project", amountPaise = 500, date = "2026-03-04", instalmentId = "plan"))
+            assertEquals(3, repository.calendarDayCounts("project", "2026-03-01", "2026-03-31").first().single().eventCount)
         } finally { repository.close() }
     }
 
@@ -774,6 +903,8 @@ class LedgerRepositoryTest {
             repository.savePayment(PaymentInput(id = "payment", projectId = "project", amountPaise = 600, date = "2026-01-02"))
             repository.allocateAdvance("payment", "expense", 400, "allocation-one")
             repository.allocateAdvance("payment", "expense", 400, "allocation-one")
+            assertEquals(1, repository.projectAudits("project").first().count { it.id == "allocation:allocation-one" })
+            assertEquals(true, repository.journal("project", ExpenseFilter()).first().any { it.event.id == "allocation:allocation-one" })
             assertEquals(600L, repository.summary("project").first().outstandingPaise)
             assertEquals(200L, repository.summary("project").first().advancePaise)
             assertThrows(IllegalArgumentException::class.java) {

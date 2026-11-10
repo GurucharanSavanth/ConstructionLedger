@@ -21,6 +21,7 @@ import java.time.LocalDate
 import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
+@SeparateVerification
 class ScheduleVolumeTest {
     @Test fun fiveHundredSchedulesKeepPartialCashSeparateAndRestoreExactly() = runBlocking<Unit> {
         val base = InstrumentationRegistry.getInstrumentation().targetContext
@@ -63,8 +64,8 @@ class ScheduleVolumeTest {
             assertEquals(500, report.counts["instalments"])
             assertEquals(5, report.counts["commitments"])
             assertEquals(1, report.counts["payments"])
-            assertEquals(0L, report.financials.recordedPaise)
-            assertEquals(4000L, report.financials.paidPaise)
+            assertEquals(java.math.BigInteger.ZERO, report.financials.recordedPaise)
+            assertEquals(java.math.BigInteger.valueOf(4000L), report.financials.paidPaise)
             service.restore(archive)
             Log.i("BuildLedgerScheduleVolume", "500 schedules | backup and verified restore | ${SystemClock.elapsedRealtime() - backupStarted} ms")
             assertEquals(paid, repository.summary("schedules").first())

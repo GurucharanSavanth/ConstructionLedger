@@ -23,6 +23,13 @@ import java.net.HttpURLConnection
 import java.security.MessageDigest
 
 internal fun newerRelease(remote: String, installed: String): Boolean {
+    fun sequence(value: String): Long? = Regex("v?f\\.(\\d{3,})").matchEntire(value)
+        ?.groupValues?.get(1)?.toLongOrNull()?.takeIf { it > 0 }
+    val nextSequence = sequence(remote)
+    val currentSequence = sequence(installed)
+    if (nextSequence != null) return if (currentSequence != null) nextSequence > currentSequence
+        else Regex("v?\\d+\\.\\d+\\.\\d+").matches(installed)
+    if (currentSequence != null) return false
     fun parts(value: String): List<Long>? = Regex("v?(\\d+)\\.(\\d+)\\.(\\d+)").matchEntire(value)
         ?.groupValues?.drop(1)?.map { it.toLongOrNull() ?: return null }
     val next = parts(remote) ?: return false

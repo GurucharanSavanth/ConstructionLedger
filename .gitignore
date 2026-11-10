@@ -18,7 +18,13 @@ local.properties
 .idea/
 .tools/
 **/node_modules/
-/BuildLedger_Web/data/
+/BuildLedger_Web/
+/app/
+/output/
+/Inspect/
+**/app/release/
+*.apk
+*.aab
 .env
 .env.*
 !.env.example

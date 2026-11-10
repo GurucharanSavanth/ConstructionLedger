@@ -20,15 +20,21 @@ import kotlinx.coroutines.launch
 
 @Composable
 internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions: UiActions,
-                          edit: () -> Unit, detail: (String, String) -> Unit) {
+                          edit: () -> Unit, detail: (String, String) -> Unit, showTitle: Boolean = true, onDeleted: () -> Unit = {}) {
     val state by vm.state.collectAsStateWithLifecycle()
     val project = state.projectId
-    val payments by remember(project) { vm.repository.payments(project) }.collectAsStateWithLifecycle(emptyList())
-    val plans by remember(project) { vm.repository.instalments(project) }.collectAsStateWithLifecycle(emptyList())
-    val commitments by remember(project) { vm.repository.commitments(project) }.collectAsStateWithLifecycle(emptyList())
-    val notes by remember(project) { vm.repository.notes(project) }.collectAsStateWithLifecycle(emptyList())
-    val files by remember(project) { vm.repository.attachments(project) }.collectAsStateWithLifecycle(emptyList())
-    val classifications by remember(project) { vm.repository.classifications(project) }.collectAsStateWithLifecycle(emptyList())
+    val payments = remember(project, type) { if (type in setOf("EXPENSE", "PAYMENT", "REVERSAL", "REFUND")) vm.repository.payments(project) else flowOf(emptyList()) }
+        .readLedger(vm) ?: return StartupScreen("Loading saved records")
+    val plans = remember(project, type) { if (type in setOf("INSTALMENT", "COMMITMENT")) vm.repository.instalments(project) else flowOf(emptyList()) }
+        .readLedger(vm) ?: return StartupScreen("Loading saved records")
+    val commitments = remember(project, type) { if (type == "COMMITMENT") vm.repository.commitments(project, includeArchived = true) else flowOf(emptyList()) }
+        .readLedger(vm) ?: return StartupScreen("Loading saved records")
+    val notes = remember(project, type) { if (type == "NOTE") vm.repository.notes(project) else flowOf(emptyList()) }
+        .readLedger(vm) ?: return StartupScreen("Loading saved records")
+    val files = remember(project, type) { if (type in setOf("EXPENSE", "PAYMENT", "REVERSAL", "REFUND", "DOCUMENT")) vm.repository.attachments(project) else flowOf(emptyList()) }
+        .readLedger(vm) ?: return StartupScreen("Loading saved records")
+    val classifications = remember(project, type) { if (type == "DOCUMENT") vm.repository.classifications(project) else flowOf(emptyList()) }
+        .readLedger(vm) ?: return StartupScreen("Loading saved records")
     val auditTable = when (type) {
         "EXPENSE" -> "expenses"
         "PAYMENT", "REVERSAL", "REFUND" -> "payments"
@@ -38,40 +44,59 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
         "DOCUMENT" -> "attachments"
         else -> ""
     }
-    val audits by remember(id, auditTable, project) {
+    val audits = remember(id, auditTable, project) {
         if (auditTable.isBlank()) flowOf(emptyList()) else vm.repository.audits(id, auditTable, project)
-    }.collectAsStateWithLifecycle(emptyList())
-    val fetchedExpense by produceState<ExpenseInput?>(null, id, project) {
-        value = vm.repository.expense(id)?.takeIf { it.projectId == project }
+    }.readLedger(vm) ?: return StartupScreen("Loading saved records")
+    val fetchedExpense = ledgerLookup(vm, id, type, project, audits) {
+        if (type == "EXPENSE") vm.repository.expense(id)?.takeIf { it.projectId == project } else null
     }
-    val expense = fetchedExpense?.takeIf { it.id == id && it.projectId == project }
-    val fetchedPaymentExpense by produceState<ExpenseRow?>(null, id, project) {
-        value = if (type == "EXPENSE") vm.repository.expenseRow(id)?.takeIf { it.projectId == project } else null
+    val expense = fetchedExpense?.value
+    val fetchedPaymentExpense = ledgerLookup(vm, id, type, project, audits, payments) {
+        if (type == "EXPENSE") vm.repository.expenseRow(id)?.takeIf { it.projectId == project } else null
     }
-    val paymentExpense = fetchedPaymentExpense?.takeIf { it.id == id && it.projectId == project }
+    val paymentExpense = fetchedPaymentExpense?.value
     var reason by rememberSaveable(id) { mutableStateOf("") }
     var date by rememberSaveable(id) { mutableStateOf(LocalDate.now().toString()) }
     var refund by rememberSaveable(id) { mutableStateOf("") }
     var name by rememberSaveable(id) { mutableStateOf("") }
     var action by remember { mutableStateOf("") }
     val payment = payments.firstOrNull { it.id == id && it.projectId == project }
-    val receiptSnapshot by produceState("" to emptyList<String>(), payment?.id) {
-        value = if (payment != null) payment.id to vm.repository.paymentAttachmentIds(payment.id) else "" to emptyList()
+    val receiptSnapshot = ledgerLookup(vm, payment?.id, audits) {
+        if (payment != null) vm.repository.paymentAttachmentIds(payment.id) else emptyList()
     }
-    val paymentReceiptIds = receiptSnapshot.second.takeIf { receiptSnapshot.first == payment?.id }.orEmpty()
+    val paymentReceiptIds = receiptSnapshot?.value.orEmpty()
     val scope = rememberCoroutineScope()
+    var paymentEdit by remember(id, project) { mutableStateOf<PaymentEditState?>(null) }
+    var paymentEditId by rememberSaveable(id, project) { mutableStateOf("") }
+    var paymentEditFingerprint by rememberSaveable(id, project) { mutableStateOf("") }
+    LaunchedEffect(id, project, paymentEditId, paymentEditFingerprint) {
+        if (paymentEditId.isNotBlank() && paymentEditFingerprint.isNotBlank() && paymentEdit == null) {
+            try {
+                val current = vm.repository.paymentEditState(paymentEditId)
+                if (current.fingerprint == paymentEditFingerprint) paymentEdit = current
+                else {
+                    paymentEditId = ""; paymentEditFingerprint = ""
+                    vm.showError("Payment changed while this correction was open. Reopen it and review the latest version.")
+                }
+            } catch (failure: Exception) {
+                paymentEditId = ""; paymentEditFingerprint = ""
+                if (failure is android.database.sqlite.SQLiteException) vm.storageFailure(failure)
+                else vm.showError(failure.message ?: "Payment correction could not be reopened.")
+            }
+        }
+    }
     var allocationPage by rememberSaveable(id) { mutableIntStateOf(0) }
     var allocationRefresh by remember(id) { mutableIntStateOf(0) }
-    val allocationKey = "${payment?.id.orEmpty()}#$allocationPage#$allocationRefresh"
-    val allocationSnapshot by produceState("" to emptyList<AllocationCorrectionState>(), payment?.id, allocationPage, allocationRefresh) {
-        value = if (type == "PAYMENT" && payment?.kind == "PAYMENT")
-            allocationKey to vm.repository.paymentAllocationStates(payment.id, 26, allocationPage * 25) else "" to emptyList()
+    val allocationSnapshot = ledgerLookup(vm, payment?.id, allocationPage, allocationRefresh, audits) {
+        if (type == "PAYMENT" && payment?.kind == "PAYMENT")
+            vm.repository.paymentAllocationStates(payment.id, 26, allocationPage * 25) else emptyList()
     }
-    val allocationRows = allocationSnapshot.second.takeIf { allocationSnapshot.first == allocationKey }.orEmpty()
-    val allocationNames by produceState(emptyMap<String, String>(), allocationRows) {
-        value = allocationRows.associate { row -> row.expenseId to
+    val allocationRows = allocationSnapshot?.value.orEmpty()
+    val allocationNamesLookup = ledgerLookup(vm, allocationRows) {
+        allocationRows.associate { row -> row.expenseId to
             (vm.repository.expense(row.expenseId)?.description ?: row.expenseId) }
     }
+    val allocationNames = allocationNamesLookup?.value.orEmpty()
     var correction by remember(id) { mutableStateOf<AllocationCorrectionState?>(null) }
     var correctionLoading by remember(id) { mutableStateOf(false) }
     var correctionAmount by remember(id) { mutableStateOf("") }
@@ -82,38 +107,39 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
     var correctionPage by remember(id) { mutableIntStateOf(0) }
     var correctionKey by remember(id) { mutableStateOf("") }
     var correctionConfirm by remember(id) { mutableStateOf(false) }
-    val targetExpenses by remember(project, correctionQuery, correctionPage) {
-        vm.repository.expenses(project, ExpenseFilter(query = correctionQuery.trim(), status = "OUTSTANDING"), 76, correctionPage * 75)
-    }.collectAsStateWithLifecycle(emptyList())
+    val loadedTargetExpenses = remember(project, type, correctionMode, correction, correctionQuery, correctionPage) {
+        if (type == "PAYMENT" && correction != null && correctionMode == "transfer")
+            vm.repository.expenses(project, ExpenseFilter(query = correctionQuery.trim(), status = "OUTSTANDING"), 76, correctionPage * 75)
+        else flowOf(emptyList())
+    }.readLedger(vm)
+    val targetExpenses = loadedTargetExpenses.orEmpty()
     val plan = plans.firstOrNull { it.id == id && it.projectId == project }
     val agreement = commitments.firstOrNull { it.id == id && it.projectId == project }
     val note = notes.firstOrNull { it.id == id && it.projectId == project }
     val file = files.firstOrNull { it.id == id && it.projectId == project }
-    var documentCategory by rememberSaveable(file?.id, file?.revision) { mutableStateOf(file?.category.orEmpty()) }
-    var documentStatus by rememberSaveable(file?.id, file?.revision) { mutableStateOf(file?.status.orEmpty()) }
-    var documentRevisionLabel by rememberSaveable(file?.id, file?.revision) { mutableStateOf(file?.revisionLabel.orEmpty()) }
-    var documentWork by rememberSaveable(file?.id, file?.revision) { mutableStateOf(file?.work.orEmpty()) }
-    var documentPlace by rememberSaveable(file?.id, file?.revision) { mutableStateOf(file?.place.orEmpty()) }
-    var documentNotes by rememberSaveable(file?.id, file?.revision) { mutableStateOf(file?.notes.orEmpty()) }
     var linkRefresh by remember(id) { mutableIntStateOf(0) }
-    val linkSnapshot by produceState(id to emptyList<Pair<String, String>>(), id, project, linkRefresh) {
-        value = id to vm.repository.attachmentLinks(id)
+    val linkSnapshot = ledgerLookup(vm, id, project, linkRefresh, audits) {
+        if (type == "DOCUMENT") vm.repository.attachmentLinks(id) else emptyList()
     }
-    val links = linkSnapshot.second.takeIf { file?.id == id && file?.projectId == project && linkSnapshot.first == id }.orEmpty()
+    val links = linkSnapshot?.value.orEmpty()
     var linkType by rememberSaveable(id) { mutableStateOf("EXPENSE") }
     var linkQuery by rememberSaveable(id) { mutableStateOf("") }
     var linkPage by rememberSaveable(id) { mutableIntStateOf(0) }
     var linkTarget by rememberSaveable(id) { mutableStateOf("") }
     var linkTargetLabel by rememberSaveable(id) { mutableStateOf("") }
     var unlinkTarget by remember(id) { mutableStateOf<Pair<String, String>?>(null) }
-    val linkCandidates by remember(project, type, linkType, linkQuery, linkPage) {
+    val loadedLinkCandidates = remember(project, type, linkType, linkQuery, linkPage) {
         if (type == "DOCUMENT" && linkQuery.length <= 200)
             vm.repository.activity(project, 76, linkPage * 75, includeExpenses = true,
                 query = linkQuery, recordType = linkType)
         else flowOf(emptyList())
-    }.collectAsStateWithLifecycle(emptyList())
+    }.readLedger(vm)
+    val linkCandidates = loadedLinkCandidates.orEmpty()
+    if (fetchedExpense == null || fetchedPaymentExpense == null || receiptSnapshot == null ||
+        allocationSnapshot == null || allocationNamesLookup == null || linkSnapshot == null)
+        return StartupScreen("Loading saved entry")
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { Title("Entry detail") }
+        if (showTitle) item { Title("Entry detail") }
         when (type) {
             "EXPENSE" -> {
                 if (expense == null) item { Text("Expense is unavailable in the selected project.") }
@@ -122,11 +148,12 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
                     item { Text("${if (row.mode == "CALCULATED") "Calculated" else "Final amount"} · ${row.note}") }
                     items(row.lines, key = { it.id }) { line -> RecordCard(line.description, line.mode, Money.format(line.amountPaise)) }
                     item { Text("Classifications: ${row.classifications.size} · linked documents: ${row.attachmentIds.size}") }
-                    item { Button({ vm.editExpense(row.id, edit) }) { Text("Edit expense") } }
+                    if (paymentExpense?.voided == true) item { Text("Voided expense") }
+                    if (paymentExpense?.voided == false) item { Button({ vm.editExpense(row.id, edit) }) { Text("Edit expense") } }
                     paymentExpense?.takeIf { !it.voided && it.outstandingPaise > 0 }?.let { unpaid -> item {
-                        OutlinedButton({ vm.preparePayment(unpaid); edit() }) { Text("Record payment of ${Money.format(unpaid.outstandingPaise)}") }
+                        OutlinedButton({ vm.preparePayment(expense = unpaid, then = edit) }) { Text("Record payment of ${Money.format(unpaid.outstandingPaise)}") }
                     } }
-                    if (row.revision != null) item { OutlinedButton({ action = "void" }) { Text("Void expense") } }
+                    if (row.revision != null && paymentExpense?.voided == false) item { OutlinedButton({ action = "delete bill" }) { Text("Delete bill") } }
                     items(row.attachmentIds, key = { it }) { attachmentId ->
                         files.firstOrNull { it.id == attachmentId && it.projectId == project }?.let { linked -> TextButton({ detail(linked.id, "DOCUMENT") }) { Text("Open ${linked.name}") } }
                     }
@@ -145,6 +172,13 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
                     row.originalPaymentId?.let { original -> item { TextButton({ detail(original, "PAYMENT") }) { Text("View original payment") } } }
                     if (row.kind == "PAYMENT") {
                         val hasRefundOrReversal = payments.any { it.originalPaymentId == row.id && it.kind in setOf("REFUND", "REVERSAL") }
+                        if (!hasRefundOrReversal) item {
+                            OutlinedButton({ vm.command("Payment loaded for editing") {
+                                paymentEdit = vm.repository.paymentEditState(row.id)
+                                paymentEditId = paymentEdit?.payment?.id.orEmpty()
+                                paymentEditFingerprint = paymentEdit?.fingerprint.orEmpty()
+                            } }, enabled = !state.saving) { Text("Edit payment") }
+                        }
                         if (hasRefundOrReversal) item { Text("Allocation corrections are unavailable after a refund or reversal.") }
                         if (!hasRefundOrReversal && allocationRows.isNotEmpty()) item { Title("Payment allocations") }
                         if (!hasRefundOrReversal) items(allocationRows.take(25), key = { it.allocationId }) { allocation ->
@@ -165,7 +199,8 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
                                         correctionPage = 0
                                         correctionKey = UUID.randomUUID().toString()
                                     } catch (failure: Exception) {
-                                        vm.showError(failure.message ?: "Could not load allocation")
+                                        if (failure is android.database.sqlite.SQLiteException) vm.storageFailure(failure)
+                                        else vm.showError(failure.message ?: "Allocation could not be opened.")
                                     } finally { correctionLoading = false }
                                 }
                             }, modifier = Modifier.semantics {
@@ -188,6 +223,7 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
                                     { correctionMode = it }, allowNone = false)
                                 if (correctionMode == "transfer") {
                                     Field("Search unpaid destination expenses", correctionQuery, { correctionQuery = it; correctionPage = 0 })
+                                    if (loadedTargetExpenses == null) Text("Loading destination expenses")
                                     val options = targetExpenses.take(75).filter { it.id != snapshot.expenseId && it.outstandingPaise > 0 }
                                         .map { it.id to "${it.description} · ${it.vendorName} · ${Money.format(it.outstandingPaise)} outstanding" }
                                     val retained = correctionTarget.takeIf { it.isNotBlank() && options.none { option -> option.first == it } }
@@ -203,31 +239,41 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
                                 }
                                 Button({ correctionConfirm = true }, enabled = !state.saving &&
                                     runCatching { Money.parse(correctionAmount) in 1..snapshot.amountPaise }.getOrDefault(false) &&
-                                    (correctionMode == "release" || correctionTarget.isNotBlank())) { Text("Review and save correction") }
+                                    (correctionMode == "release" || loadedTargetExpenses != null && correctionTarget.isNotBlank())) { Text("Review and save correction") }
                                 TextButton({ correction = null }) { Text("Cancel correction") }
                             }
                         }
-                        item { Field("Refund or reversal reason", reason, { reason = it }) }
-                        item { DateField("Refund or reversal date", date, { date = it }) }
-                        item { OutlinedButton({ action = "reverse" }) { Text("Reverse payment") } }
-                        item { Field("Refund amount (₹)", refund, { refund = it }, true) }
-                        item { OutlinedButton({ action = "refund" }) { Text("Refund settled funds") } }
+                        val correctedCash = Money.sum(payments.filter { it.originalPaymentId == row.id }.map { it.amountPaise })
+                        if (correctedCash < row.amountPaise) {
+                            item { Field("Refund or reversal reason", reason, { reason = it }) }
+                            item { DateField("Refund or reversal date", date, { date = it }) }
+                            item { OutlinedButton({ action = "reverse" }) { Text("Reverse payment") } }
+                            item { Field("Refund amount (₹)", refund, { refund = it }, numeric = true) }
+                            item { OutlinedButton({ action = "refund" }) { Text("Refund settled funds") } }
+                        } else item { Text("This payment has been fully reversed or refunded. Its history remains available.") }
                     }
                 }
             }
             "INSTALMENT" -> plan?.let { row ->
                 item { RecordCard(row.title, "${row.dueDate} · ${if (row.cancelled) "Cancelled" else if (row.outstandingPaise == 0L) "Paid" else "Due"}", Money.format(row.outstandingPaise)) }
                 item { Text("Scheduled ${Money.format(row.amountPaise)} · paid ${Money.format(row.paidPaise)}") }
+                if (row.note.isNotBlank()) item { Text(row.note) }
                 if (!row.cancelled) {
-                    if (row.outstandingPaise > 0) item { Button({ vm.preparePayment(instalment = row); edit() }) { Text("Record payment") } }
+                    if (row.outstandingPaise > 0) item { Button({ vm.preparePayment(instalment = row, then = edit) }) { Text("Record payment") } }
                     item { OutlinedButton({ vm.editInstalment(row, edit) }) { Text("Edit schedule") } }
                     item { OutlinedButton({ action = "cancel" }) { Text("Cancel future schedule") } }
                 }
             }
             "COMMITMENT" -> agreement?.let { row ->
                 item { RecordCard(row.title, "${row.date}${if (row.archived) " · Archived" else ""}", Money.format(row.amountPaise)) }
+                if (row.note.isNotBlank()) item { Text(row.note) }
+                if (row.calculationJson.isNotBlank()) item {
+                    val calculation = org.json.JSONObject(row.calculationJson)
+                    Text("Agreed calculation: ${calculation.getString("quantity")} ${calculation.getString("quantityUnit")} × ₹${calculation.getString("rate")} per ${calculation.getString("rateUnit")} × ${calculation.getString("multiplier")}")
+                }
                 if (!row.archived) item { OutlinedButton({ vm.editCommitment(row, edit) }) { Text("Edit commitment") } }
                 if (!row.archived) item { OutlinedButton({ action = "archive agreement" }) { Text("Archive commitment") } }
+                if (!row.archived) item { OutlinedButton({ action = "cancel agreement" }) { Text("Cancel commitment and schedules") } }
                 items(plans.filter { it.commitmentId == row.id }, key = { it.id }) { schedule ->
                     RecordCard(schedule.title, schedule.dueDate, Money.format(schedule.outstandingPaise)) { detail(schedule.id, "INSTALMENT") }
                 }
@@ -240,18 +286,27 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
             }
             "DOCUMENT" -> file?.let { row ->
                 item { RecordCard(row.name, "${row.mimeType} · ${row.size} bytes · ${row.referenceCount} linked records") }
-                item { Section("Document details") {
+                item(key = "document-details-${row.id}") {
+                    var documentCategory by rememberSaveable(row.id, row.revision) { mutableStateOf(row.category) }
+                    var documentStatus by rememberSaveable(row.id, row.revision) { mutableStateOf(row.status) }
+                    var documentRevisionLabel by rememberSaveable(row.id, row.revision) { mutableStateOf(row.revisionLabel) }
+                    var documentWork by rememberSaveable(row.id, row.revision) { mutableStateOf(row.work) }
+                    var documentPlace by rememberSaveable(row.id, row.revision) { mutableStateOf(row.place) }
+                    var documentNotes by rememberSaveable(row.id, row.revision) { mutableStateOf(row.notes) }
+                    Section("Document details") {
                     Text("SHA-256 ${row.sha256}")
+                    Choice("Suggested category", documentCategory,
+                        com.constructioncost.nativeapp.platform.files.DocumentPolicy.categories.map { it to it }, { documentCategory = it })
                     Field("Category", documentCategory, { documentCategory = it })
                     Field("Status", documentStatus, { documentStatus = it })
                     Field("Revision label", documentRevisionLabel, { documentRevisionLabel = it })
                     Field("Work", documentWork, { documentWork = it })
-                    Choice("Suggested work stage", documentWork,
+                    ClassificationChoice(vm, state.projectId, "Suggested work stage", documentWork,
                         classifications.filter { it.kind == "STAGE" && it.parentId == null && !it.archived }
                             .sortedWith(compareBy<ClassificationInfo> { it.sortOrder }.thenBy { it.name })
                             .distinctBy { it.name }
                             .map { it.name to it.name },
-                        { documentWork = it }, allowNone = false)
+                        classifications, "STAGE", choose = { documentWork = it }, onCreated = { documentWork = it.name })
                     Text("Choose a stage or keep your custom Work text.", style = MaterialTheme.typography.bodySmall)
                     Field("Place", documentPlace, { documentPlace = it })
                     Field("Notes", documentNotes, { documentNotes = it }, multiline = true)
@@ -274,6 +329,7 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
                         linkType = it; linkTarget = ""; linkTargetLabel = ""; linkPage = 0
                     }, allowNone = false)
                     Field("Search records", linkQuery, { linkQuery = it; linkPage = 0 })
+                    if (loadedLinkCandidates == null) Text("Loading records")
                     if (linkQuery.length > 200) Text("Search must be 200 characters or less.", color = MaterialTheme.colorScheme.error)
                     val options = linkCandidates.take(75)
                         .filter { candidate -> links.none { it.first == linkType && it.second == candidate.id } }
@@ -282,7 +338,7 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
                     val retained = linkTarget.takeIf { it.isNotBlank() && options.none { option -> option.first == it } }
                         ?.let { it to linkTargetLabel }
                     val choices = listOfNotNull(retained) + options
-                    if (choices.isEmpty() && linkQuery.length <= 200) Text("No unlinked records on this page.")
+                    if (loadedLinkCandidates != null && choices.isEmpty() && linkQuery.length <= 200) Text("No unlinked records on this page.")
                     Choice("Ledger entry", linkTarget, choices, { selected ->
                         linkTarget = selected
                         linkTargetLabel = choices.firstOrNull { it.first == selected }?.second.orEmpty()
@@ -304,7 +360,7 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
                             linkRefresh++
                             linkTarget = ""; linkTargetLabel = ""
                         }
-                    }, enabled = !state.saving && linkTarget.isNotBlank() && linkQuery.length <= 200) { Text("Link document") }
+                    }, enabled = !state.saving && loadedLinkCandidates != null && linkTarget.isNotBlank() && linkQuery.length <= 200) { Text("Link document") }
                 } }
                 if (links.isNotEmpty()) item { Title("Linked records") }
                 items(links, key = { "${it.first}-${it.second}" }) { (recordType, recordId) ->
@@ -324,15 +380,16 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
         if (type !in setOf("EXPENSE", "PAYMENT", "REVERSAL", "REFUND", "INSTALMENT", "COMMITMENT", "NOTE", "DOCUMENT")) item {
             Text("This record type has no detail view: $type")
         }
-        state.error?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
+        state.actionError?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
         item { Title("Change history") }
         items(audits, key = { it.id }) { row ->
             Section("${row.action} · ${java.time.Instant.ofEpochMilli(row.createdAt)}") {
-                Text("Before: ${row.beforeJson}")
-                Text("After: ${row.afterJson}")
+                AuditChanges(row)
             }
         }
     }
+    paymentEdit?.let { snapshot -> PaymentEditDialog(vm, snapshot,
+        { paymentEdit = null; paymentEditId = ""; paymentEditFingerprint = "" }, { detail(it, "PAYMENT") }) }
     if (correctionConfirm && correction != null) Confirm("Correct allocation?",
         "Move ${correctionAmount} from the current expense ${if (correctionMode == "release") "to an advance" else "to ${correctionTargetLabel}"}. Recorded cash will not change.",
         {
@@ -355,16 +412,22 @@ internal fun DetailScreen(vm: LedgerViewModel, id: String, type: String, actions
             } }, { unlinkTarget = null })
     }
     when (action) {
-        "void" -> Confirm("Void expense?", "This keeps its audit history. Settled payments must be reversed first.",
-            { expense?.revision?.let { revision -> vm.command("Expense voided") { vm.repository.voidExpense(id, revision) } } }, { action = "" })
+        "delete bill" -> Confirm("Delete bill?", "The bill cost is removed. Cash payments stay recorded and become available as advances. Original documents and the permanent change log are kept.",
+            { expense?.revision?.let { revision -> vm.command("Bill deleted; cash and originals preserved") { vm.repository.deleteExpense(id, revision); onDeleted() } } }, { action = "" })
         "reverse" -> Confirm("Reverse payment?", "The original and its allocations remain in history. Cash and settlement are reversed exactly once.",
-            { vm.command("Payment reversed") { require(reason.isNotBlank()); vm.repository.reversePayment(id, reason.trim(), date) } }, { action = "" })
+            { vm.command("Payment reversed") { require(reason.isNotBlank()) { "Enter a reason for the reversal." }; vm.repository.reversePayment(id, reason.trim(), date) } }, { action = "" })
         "refund" -> Confirm("Refund settled funds?", "This reduces cash and settlement by the entered amount.",
-            { vm.command("Refund recorded") { require(reason.isNotBlank()); vm.repository.refundPayment(id, Money.parse(refund), reason.trim(), date) } }, { action = "" })
+            { vm.command("Refund recorded") { require(reason.isNotBlank()) { "Enter a reason for the refund." }; vm.repository.refundPayment(id, Money.parse(refund), reason.trim(), date) } }, { action = "" })
         "cancel" -> Confirm("Cancel schedule?", "Already recorded cash stays in the ledger.",
             { plan?.let { vm.command("Schedule cancelled") { vm.repository.cancelInstalment(id, it.revision) } } }, { action = "" })
-        "archive agreement" -> Confirm("Archive commitment?", "The agreement leaves active plans. Its schedules, payments and history remain available.",
+        "archive agreement" -> Confirm("Archive commitment?", "This hides the agreement from active commitments. Its schedules stay active; payments and history remain available.",
             { agreement?.let { vm.command("Commitment archived") { vm.repository.archiveCommitment(id, it.revision) } } }, { action = "" })
+        "cancel agreement" -> Confirm("Cancel commitment and schedules?", "This cancels all its active schedules and reminders. Recorded payments, documents and change history stay available.",
+            {
+                val selected = agreement
+                val revisions = plans.filter { it.commitmentId == id && !it.cancelled }.associate { it.id to it.revision }
+                selected?.let { vm.command("Commitment and schedules cancelled") { vm.repository.cancelCommitment(id, it.revision, revisions) } }
+            }, { action = "" })
         "delete note" -> Confirm("Delete work log?", "The work log is removed; its audit history remains.",
             { note?.let { vm.command("Work log deleted") { vm.repository.deleteNote(id, it.revision) } } }, { action = "" })
         "delete document" -> Confirm("Delete original document?", "This permanently removes its bytes. Linked or revision source documents may need unlinking first.",

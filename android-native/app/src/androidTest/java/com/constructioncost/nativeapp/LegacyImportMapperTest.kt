@@ -4,6 +4,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.constructioncost.nativeapp.data.repository.LedgerRepository
 import com.constructioncost.nativeapp.platform.LegacyImportMapper
+import com.constructioncost.nativeapp.domain.Money
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
@@ -43,6 +44,32 @@ class LegacyImportMapperTest {
         assertEquals(11120L, (0 until lines.length()).sumOf { lines.getJSONObject(it).getLong("amountPaise") })
         val repository = LedgerRepository.inMemory(context)
         try { repository.validateRecords(mapped.records) } finally { repository.close() }
+    }
+
+    @Test fun omittedQuantityUnitUsesRateUnitAndRemainsCalculableAfterImport() = runBlocking<Unit> {
+        for (quantityUnit in listOf("absent", "null", "blank")) {
+            val line = JSONObject().put("label", "Steel").put("mode", "calculated")
+                .put("qty", "2").put("rate", "10").put("unitId", "kg").put("value", 2000L)
+            when (quantityUnit) {
+                "null" -> line.put("quantityUnitId", JSONObject.NULL)
+                "blank" -> line.put("quantityUnitId", "")
+            }
+            val source = fixture().put("payments", JSONArray()).put("allocations", JSONArray())
+            source.getJSONArray("bills").getJSONObject(0).put("total", 2000L)
+                .put("extras", 0).put("tax", 0).put("discount", 0).put("lines", JSONArray().put(line))
+            val repository = LedgerRepository.inMemory(context)
+            try {
+                repository.replaceRecords(LegacyImportMapper(context).map(source).records)
+                val expense = repository.expense("legacy:bill:bill-1")!!
+                val imported = expense.lines.single()
+                assertEquals("kg", imported.quantityUnit)
+                assertEquals("kg", imported.rateUnit)
+                assertEquals(2000L, Money.calculate(imported.quantity!!, imported.rate!!, imported.multiplier,
+                    quantityUnit = imported.quantityUnit, rateUnit = imported.rateUnit).totalPaise)
+                repository.saveExpense(expense.copy(description = "Edited steel invoice"))
+                assertEquals("kg", repository.expense(expense.id)!!.lines.single().quantityUnit)
+            } finally { repository.close() }
+        }
     }
     @Test fun legacyAuditExportsWithItsKnownProjectWithoutGuessingTargetNamespace() = runBlocking<Unit> {
         val source = fixture().put("audit", JSONArray().put(JSONObject().put("id", "legacy-change")

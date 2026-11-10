@@ -1,6 +1,8 @@
 package com.constructioncost.nativeapp.ui
 
+import android.app.Application
 import android.content.Context
+import com.constructioncost.nativeapp.ReminderScheduler
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
@@ -10,13 +12,15 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.constructioncost.nativeapp.data.repository.LedgerRepository
+import com.constructioncost.nativeapp.data.local.LedgerRecoveryState
+import com.constructioncost.nativeapp.data.local.LedgerRecoveryStateStore
 import com.constructioncost.nativeapp.domain.*
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -33,7 +37,12 @@ data class EntryDraft(val fields: Map<String, String> = emptyMap()) {
     val id get() = get("id")
     val projectId get() = get("projectId")
     val date get() = get("date", LocalDate.now().toString())
-    val hasContent get() = get("description").isNotBlank() || get("amount").isNotBlank() || get("note").isNotBlank()
+    val hasContent get() = fields.any { (key, value) -> when (key) {
+        "id", "key", "projectId", "kind" -> false
+        "date" -> value != LocalDate.now().toString()
+        "mode" -> value != "DIRECT_AMOUNT"
+        else -> value.isNotBlank()
+    } }
     fun json(): String = JSONObject(fields).toString()
 
     companion object {
@@ -50,83 +59,215 @@ data class EntryDraft(val fields: Map<String, String> = emptyMap()) {
 
 data class LedgerUiState(
     val ready: Boolean = false, val projectId: String = "", val draft: EntryDraft = EntryDraft(),
-    val saving: Boolean = false, val error: String? = null, val message: String? = null,
-    val reminders: Boolean = false, val showArchived: Boolean = false
-)
+    val saving: Boolean = false, val error: String? = null, val actionError: String? = null,
+    val pendingDraftReplacement: Boolean = false, val message: String? = null,
+    val reminders: Boolean = false, val showArchived: Boolean = false, val recoveryRequired: Boolean = false,
+    val recoveryState: LedgerRecoveryState? = null, val projects: List<ProjectInfo> = emptyList()
+) {
+    val hasActiveProject get() = ready && !recoveryRequired && projects.any { it.id == projectId && !it.archived }
+}
+
+internal const val CREATE_PROJECT_MESSAGE = "Create a project before using BuildLedger"
 
 /** Repository writes are the only authority; an unsuccessful save never clears the durable draft. */
 class LedgerViewModel(
-    private val context: Context,
+    context: Context,
     val repository: LedgerRepository,
     private val savedState: SavedStateHandle,
-    private val preferenceStore: DataStore<Preferences> = context.ledgerPreferences
+    private val preferenceStore: DataStore<Preferences> = context.applicationContext.ledgerPreferences
 ) : ViewModel() {
+    private val context: Application = context.applicationContext as Application
     private val mutable = MutableStateFlow(LedgerUiState())
     val state: StateFlow<LedgerUiState> = mutable.asStateFlow()
     private val writes = Mutex()
     private val draftKey = stringPreferencesKey("entry_draft")
     private val projectKey = stringPreferencesKey("project")
     private val settingsKey = stringPreferencesKey("settings")
+    private var initialization: Job? = null
+    private var unreadableDraft = false
+    private var unreadableSettings = false
+    private var pendingReplacement: (() -> Unit)? = null
 
-    init {
-        viewModelScope.launch {
+    init { initialize() }
+
+    fun retryInitialization() {
+        val recovery = LedgerRecoveryStateStore(context)
+        if (recovery.isRecoveryRequired() && !recovery.clearForSafeOpenRetry()) {
+            mutable.value = mutable.value.copy(error = "Select a verified backup to continue recovery.")
+            return
+        }
+        val current = mutable.value
+        if (current.projectId.isNotBlank()) savedState["project"] = current.projectId
+        if (!unreadableDraft && current.draft.id.isNotBlank()) savedState["draft"] = current.draft.json()
+        initialization?.cancel()
+        mutable.value = current.copy(ready = false, recoveryRequired = false, error = null)
+        initialize()
+    }
+
+    private fun initialize() {
+        initialization = viewModelScope.launch {
             try {
-                val preferences = preferenceStore.data.first()
-                val projects = repository.projects.first { it.isNotEmpty() }
-                val selected = savedState.get<String>("project") ?: preferences[projectKey]
-                val projectId = projects.firstOrNull { it.id == selected }?.id ?: projects.firstOrNull { !it.archived }?.id.orEmpty()
-                val draftText = savedState.get<String>("draft") ?: preferences[draftKey]
-                val draft = draftText?.let { EntryDraft.read(it) } ?: EntryDraft.fresh(projectId)
-                val settings = JSONObject(preferences[settingsKey] ?: "{}")
+                val projects = repository.projects.first()
+                var preferenceError: String? = null
+                val preferences = try { preferenceStore.data.first() }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (failure: Exception) {
+                    preferenceError = "Preferences are unavailable. Your ledger remains available; draft and display settings may not be saved. ${failure.message.orEmpty()}"
+                    null
+                }
+                val selected = try { savedState.get<String>("project") ?: preferences?.get(projectKey) }
+                catch (failure: Exception) { preferenceError = "Saved project selection could not be read. The original preferences were retained."; null }
+                val projectId = projects.firstOrNull { it.id == selected && !it.archived }?.id
+                    ?: projects.firstOrNull { !it.archived }?.id.orEmpty()
+                unreadableDraft = false
+                unreadableSettings = false
+                val draft = try {
+                    val draftText = savedState.get<String>("draft") ?: preferences?.get(draftKey)
+                    draftText?.let { EntryDraft.read(it) }?.takeIf { it.projectId == projectId || it.hasContent } ?: EntryDraft.fresh(projectId)
+                }
+                catch (failure: Exception) {
+                    unreadableDraft = true
+                    preferenceError = "The saved entry draft could not be read. The original preferences were retained."
+                    EntryDraft.fresh(projectId)
+                }
+                val settings = try { JSONObject(preferences?.get(settingsKey) ?: JSONObject()
+                    .put("reminders", mutable.value.reminders).put("showArchived", mutable.value.showArchived).toString()).also { settings ->
+                        for (key in listOf("reminders", "showArchived")) require(!settings.has(key) || settings.get(key) is Boolean) { "Invalid saved setting" }
+                    } }
+                catch (failure: Exception) {
+                    unreadableSettings = true
+                    preferenceError = "Saved display settings could not be read. Defaults are shown; the original preferences were retained."
+                    JSONObject()
+                }
                 mutable.value = LedgerUiState(true, projectId, draft,
-                    reminders = settings.optBoolean("reminders"), showArchived = settings.optBoolean("showArchived"))
+                    error = preferenceError, reminders = settings.optBoolean("reminders"), showArchived = settings.optBoolean("showArchived"),
+                    recoveryState = if (preferenceError == null) LedgerRecoveryState.HEALTHY_EXISTING_DATABASE else LedgerRecoveryState.PREFERENCES_UNAVAILABLE,
+                    projects = projects)
+                if (projectId.isBlank() && preferences != null) persistPreference("Empty project selection could not be saved.") {
+                    preferenceStore.edit { it.remove(projectKey); if (!unreadableDraft) it[draftKey] = draft.json() }
+                }
                 repository.projects.collect { available ->
+                    mutable.value = mutable.value.copy(projects = available)
                     val selectedId = mutable.value.projectId
+                    if (available.isEmpty()) {
+                        if (selectedId.isNotBlank()) {
+                            val retained = mutable.value.draft.takeIf { it.hasContent } ?: EntryDraft.fresh("")
+                            mutable.value = mutable.value.copy(projectId = "", draft = retained)
+                            savedState["project"] = ""
+                            savedState["draft"] = retained.json()
+                            persistPreference("Empty project selection could not be saved.") {
+                                preferenceStore.edit { it.remove(projectKey); if (!unreadableDraft) it[draftKey] = retained.json() }
+                            }
+                        }
+                        return@collect
+                    }
                     if (available.any { it.id == selectedId && !it.archived }) return@collect
-                    val next = available.firstOrNull { !it.archived }?.id ?: available.firstOrNull()?.id.orEmpty()
+                    val next = available.firstOrNull { !it.archived }?.id.orEmpty()
                     if (next == selectedId) return@collect
+                    if (next.isBlank()) {
+                        val retained = mutable.value.draft.takeIf { it.hasContent } ?: EntryDraft.fresh("")
+                        mutable.value = mutable.value.copy(projectId = "", draft = retained)
+                        savedState["project"] = ""
+                        savedState["draft"] = retained.json()
+                        persistPreference("Empty project selection could not be saved.") {
+                            preferenceStore.edit { it.remove(projectKey); if (!unreadableDraft) it[draftKey] = retained.json() }
+                        }
+                        return@collect
+                    }
                     val retained = mutable.value.draft.takeIf { it.hasContent } ?: EntryDraft.fresh(next, mutable.value.draft.kind)
                     mutable.value = mutable.value.copy(projectId = next, draft = retained)
                     savedState["project"] = next
                     savedState["draft"] = retained.json()
-                    preferenceStore.edit { it[projectKey] = next; it[draftKey] = retained.json() }
+                    persistPreference("Project selection changed on screen but could not be saved.") {
+                        preferenceStore.edit { it[projectKey] = next; it[draftKey] = retained.json() }
+                    }
                 }
+            } catch (cancelled: CancellationException) { throw cancelled
             } catch (error: Exception) {
-                mutable.value = mutable.value.copy(ready = true, error = "Unable to load local preferences: ${error.message}")
+                storageFailure(error)
             }
         }
+    }
+
+    internal fun storageFailure(error: Throwable) {
+        if (error !is Exception || error is CancellationException) throw error
+        val recovery = LedgerRecoveryStateStore(context)
+        if (!recovery.isRecoveryRequired()) recovery.markRecoveryRequired(LedgerRecoveryState.DATABASE_OPEN_FAILURE,
+            error.message ?: "The local database could not be read.")
+        mutable.value = mutable.value.copy(ready = true, projectId = "", recoveryRequired = true,
+            recoveryState = recovery.state(),
+            error = "Your saved ledger could not be safely read. Select a verified backup or retry. ${error.message.orEmpty()}")
     }
 
     fun field(key: String, value: String) {
         if (mutable.value.saving) return
         val draft = mutable.value.draft.with(key, value)
-        mutable.value = mutable.value.copy(draft = draft, error = null, message = null)
+        mutable.value = mutable.value.copy(draft = draft, actionError = null, message = null)
         savedState["draft"] = draft.json()
         viewModelScope.launch { persistDraft(draft) }
     }
 
     private suspend fun persistDraft(draft: EntryDraft) = writes.withLock {
         // A queued keystroke must never overwrite a newer draft or the cleared successful submission.
-        if (mutable.value.draft == draft) preferenceStore.edit { it[draftKey] = draft.json() }
+        if (mutable.value.draft == draft && persistPreference("This draft is still visible but was not saved to this device. Retry saving it.") {
+            preferenceStore.edit { it[draftKey] = draft.json() }
+        }) unreadableDraft = false
+    }
+
+    private suspend fun persistPreference(failureMessage: String, action: suspend () -> Unit): Boolean {
+        try { action(); return true }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (failure: Exception) { mutable.value = mutable.value.copy(recoveryState = LedgerRecoveryState.PREFERENCES_UNAVAILABLE,
+            error = "$failureMessage ${failure.message.orEmpty()}", message = null); return false }
+    }
+
+    fun retryPreferences() {
+        viewModelScope.launch {
+            writes.withLock {
+                val current = mutable.value
+                try {
+                    preferenceStore.edit {
+                        it[projectKey] = current.projectId
+                        if (!unreadableDraft) it[draftKey] = current.draft.json()
+                        if (!unreadableSettings) it[settingsKey] = JSONObject().put("reminders", current.reminders)
+                            .put("showArchived", current.showArchived).toString()
+                    }
+                    if (!unreadableDraft && !unreadableSettings && mutable.value == current) {
+                        mutable.value = current.copy(recoveryState = LedgerRecoveryState.HEALTHY_EXISTING_DATABASE, error = null)
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (failure: Exception) {
+                    mutable.value = mutable.value.copy(recoveryState = LedgerRecoveryState.PREFERENCES_UNAVAILABLE,
+                        error = "Draft and settings remain visible but were not saved. ${failure.message.orEmpty()}")
+                }
+            }
+        }
     }
 
     fun selectProject(id: String) {
+        if (!mutable.value.ready || mutable.value.recoveryRequired || mutable.value.projects.none { it.id == id && !it.archived }) {
+            showError(CREATE_PROJECT_MESSAGE)
+            return
+        }
+        cancelDraftReplacement()
         mutable.value = mutable.value.copy(projectId = id)
         savedState["project"] = id
-        viewModelScope.launch { preferenceStore.edit { it[projectKey] = id } }
+        viewModelScope.launch { persistPreference("Project selection is visible for this session but was not saved. Change it again to retry.") {
+            preferenceStore.edit { it[projectKey] = id }
+        } }
         if (!mutable.value.draft.hasContent) resetDraft()
     }
 
     fun resetDraft(kind: String = mutable.value.draft.kind) {
         if (mutable.value.saving) return
         val draft = EntryDraft.fresh(mutable.value.projectId, kind)
-        mutable.value = mutable.value.copy(draft = draft, error = null)
+        mutable.value = mutable.value.copy(draft = draft, actionError = null)
         savedState["draft"] = draft.json()
         viewModelScope.launch { persistDraft(draft) }
     }
 
     fun reassignDraftToCurrentProject() {
-        if (mutable.value.saving || mutable.value.projectId.isBlank()) return
+        if (mutable.value.saving || !mutable.value.hasActiveProject) return
         val draft = movedDraftToProject(mutable.value.draft, mutable.value.projectId)
         mutable.value = mutable.value.copy(draft = draft, error = null, message = "Draft moved to the current project. Review its links and schedule before saving.")
         savedState["draft"] = draft.json()
@@ -150,32 +291,122 @@ class LedgerViewModel(
     }
 
     fun settings(reminders: Boolean = mutable.value.reminders, showArchived: Boolean = mutable.value.showArchived) {
+        val changedReminders = reminders != mutable.value.reminders
+        val changedArchived = showArchived != mutable.value.showArchived
+        val repairUnreadable = unreadableSettings
         mutable.value = mutable.value.copy(reminders = reminders, showArchived = showArchived)
-        viewModelScope.launch {
+        viewModelScope.launch { if (persistPreference("Settings are visible for this session but were not saved. Change them again to retry.") {
             preferenceStore.edit {
-                it[settingsKey] = JSONObject().put("reminders", reminders).put("showArchived", showArchived).toString()
+                val saved = if (repairUnreadable) JSONObject() else JSONObject(it[settingsKey] ?: "{}")
+                if (changedReminders) saved.put("reminders", reminders)
+                if (changedArchived) saved.put("showArchived", showArchived)
+                if (repairUnreadable || (!changedReminders && !changedArchived))
+                    saved.put("reminders", reminders).put("showArchived", showArchived)
+                it[settingsKey] = saved.toString()
+            }
+        }) unreadableSettings = false }
+    }
+
+    /** The ViewModel survives Activity recreation while a permission result is waiting for DataStore. */
+    internal fun applyReminderPermissionResult(enabled: Boolean) {
+        viewModelScope.launch {
+            writes.withLock {
+                val actual = enabled && ReminderScheduler.permissionGranted(context)
+                if (!persistPreference("Reminder setting was not saved. Try again in Settings.") {
+                    preferenceStore.edit { preferences ->
+                        preferences[settingsKey] = (if (unreadableSettings) JSONObject().put("showArchived", mutable.value.showArchived)
+                            else JSONObject(preferences[settingsKey] ?: "{}"))
+                            .put("reminders", actual).toString()
+                    }
+                }) return@withLock
+                try { ReminderScheduler.configure(context, actual) }
+                catch (failure: Exception) {
+                    mutable.value = mutable.value.copy(actionError = "Local reminders could not be scheduled. Try again in Settings.")
+                }
+                state.first { it.ready || it.recoveryRequired }
+                if (!mutable.value.recoveryRequired) reflectReminders(actual)
+                unreadableSettings = false
             }
         }
     }
 
+    /** Read after queued reminder writes, so a recreated Activity cannot restore a stale switch. */
+    internal suspend fun reconcileReminders(): Boolean {
+        state.first { it.ready || it.recoveryRequired }
+        if (mutable.value.recoveryRequired) { ReminderScheduler.configure(context, false); return false }
+        return writes.withLock {
+            val preferences = preferenceStore.data.first()
+            val saved = JSONObject(preferences[settingsKey] ?: "{}").optBoolean("reminders")
+            val actual = saved && ReminderScheduler.permissionGranted(context)
+            if (saved && !actual) preferenceStore.edit { current ->
+                current[settingsKey] = JSONObject(current[settingsKey] ?: "{}").put("reminders", false).toString()
+            }
+            ReminderScheduler.configure(context, actual)
+            reflectReminders(actual)
+            saved && !actual
+        }
+    }
+
+    private fun reflectReminders(enabled: Boolean) { mutable.value = mutable.value.copy(reminders = enabled) }
+
     fun dismissMessage() { mutable.value = mutable.value.copy(message = null) }
-    fun showError(message: String) { mutable.value = mutable.value.copy(error = message) }
+    fun dismissActionError() { mutable.value = mutable.value.copy(actionError = null) }
+    fun showError(message: String) { mutable.value = mutable.value.copy(actionError = message) }
+
+    fun requestDraftReplacement(resume: Boolean = false, replace: () -> Unit) {
+        if (mutable.value.saving) return
+        if (!mutable.value.hasActiveProject) { showError(CREATE_PROJECT_MESSAGE); return }
+        if (mutable.value.draft.hasContent && !resume) {
+            pendingReplacement = replace
+            mutable.value = mutable.value.copy(pendingDraftReplacement = true)
+        } else replace()
+    }
+
+    fun cancelDraftReplacement() {
+        pendingReplacement = null
+        mutable.value = mutable.value.copy(pendingDraftReplacement = false)
+    }
+
+    fun confirmDraftReplacement() {
+        val replace = pendingReplacement ?: return
+        cancelDraftReplacement()
+        replace()
+    }
+
+    fun openNewEntry(kind: String, date: String? = null, then: () -> Unit) {
+        if (!mutable.value.hasActiveProject) { showError(CREATE_PROJECT_MESSAGE); return }
+        val draft = mutable.value.draft
+        val compatible = draft.kind == kind && draft.get("revision").isBlank()
+        requestDraftReplacement(compatible && (date == null || date == draft.date || !draft.hasContent)) {
+            if (!compatible || date != null && date != draft.date) {
+                val fresh = if (compatible && !draft.hasContent) draft else EntryDraft.fresh(mutable.value.projectId, kind)
+                loadDraft((if (date == null) fresh else fresh.with("date", date)).fields, then)
+            } else then()
+        }
+    }
 
     fun command(success: String, action: suspend () -> Unit) {
         if (mutable.value.saving) return
-        mutable.value = mutable.value.copy(saving = true, error = null, message = null)
+        mutable.value = mutable.value.copy(saving = true, actionError = null, message = null)
         viewModelScope.launch {
             try {
                 action()
+                ReminderScheduler.refreshPosted(context, repository)
                 mutable.value = mutable.value.copy(saving = false, message = success)
             } catch (error: CancellationException) { throw error
             } catch (error: Exception) {
-                mutable.value = mutable.value.copy(saving = false, error = error.message ?: "Save failed. Your inputs are retained.")
+                if (error is android.database.sqlite.SQLiteException) storageFailure(error)
+                mutable.value = if (mutable.value.recoveryRequired) mutable.value.copy(saving = false)
+                    else mutable.value.copy(saving = false, actionError = error.message ?: "Save failed. Your inputs are retained.")
             }
         }
     }
 
     fun editExpense(id: String, then: () -> Unit) {
+        val resume = mutable.value.draft.id == id && mutable.value.draft.get("revision").isNotBlank() &&
+            mutable.value.draft.kind !in setOf("Payment", "Plan", "Contract", "Work log")
+        requestDraftReplacement(resume) {
+        if (resume) { then(); return@requestDraftReplacement }
         command("Expense loaded for editing") {
             val expense = repository.expense(id) ?: error("Expense no longer exists.")
             val draft = draftForExpense(expense)
@@ -184,9 +415,13 @@ class LedgerViewModel(
             persistDraft(draft)
             then()
         }
+        }
     }
 
     fun editInstalment(row: InstalmentRow, then: () -> Unit) {
+        requestDraftReplacement(mutable.value.draft.id == row.id && mutable.value.draft.kind == "Plan" &&
+            mutable.value.draft.get("revision").isNotBlank()) {
+        if (mutable.value.draft.id == row.id && mutable.value.draft.kind == "Plan" && mutable.value.draft.get("revision").isNotBlank()) { then(); return@requestDraftReplacement }
         command("Schedule loaded for editing") {
             val selected = repository.plannedClassifications("INSTALMENT", row.id)
             val nodes = repository.classifications(row.projectId).first()
@@ -195,16 +430,20 @@ class LedgerViewModel(
                 "description" to row.title, "amount" to Money.input(row.amountPaise), "date" to row.dueDate,
                 "vendor" to row.vendorId.orEmpty(), "commitment" to row.commitmentId.orEmpty(),
                 "remind" to row.remind.toString(), "revision" to row.revision.toString(),
-                "reminderDays" to row.reminderDays.toString()
+                "reminderDays" to row.reminderDays.toString(), "note" to row.note
             ) + plannedFields(selected, nodes))
             mutable.value = mutable.value.copy(draft = draft)
             savedState["draft"] = draft.json()
             persistDraft(draft)
             then()
         }
+        }
     }
 
     fun editCommitment(row: CommitmentInfo, then: () -> Unit) {
+        requestDraftReplacement(mutable.value.draft.id == row.id && mutable.value.draft.kind == "Contract" &&
+            mutable.value.draft.get("revision").isNotBlank()) {
+        if (mutable.value.draft.id == row.id && mutable.value.draft.kind == "Contract" && mutable.value.draft.get("revision").isNotBlank()) { then(); return@requestDraftReplacement }
         command("Commitment loaded for editing") {
             val plans = repository.instalments(row.projectId).first().filter { it.commitmentId == row.id && !it.cancelled }
             val selected = repository.plannedClassifications("COMMITMENT", row.id)
@@ -215,40 +454,66 @@ class LedgerViewModel(
             persistDraft(draft)
             then()
         }
+        }
     }
 
-    fun editNote(row: ActivityNote, then: () -> Unit) = loadDraft(mapOf(
+    fun editNote(row: ActivityNote, then: () -> Unit) = requestDraftReplacement(
+        mutable.value.draft.id == row.id && mutable.value.draft.kind == "Work log" && mutable.value.draft.get("revision").isNotBlank()) {
+        if (mutable.value.draft.id == row.id && mutable.value.draft.kind == "Work log" && mutable.value.draft.get("revision").isNotBlank()) { then(); return@requestDraftReplacement }
+        loadDraft(mapOf(
         "id" to row.id, "key" to newId(), "projectId" to row.projectId, "kind" to "Work log",
         "description" to row.title, "date" to row.date, "note" to row.note,
         "revision" to row.revision.toString()
-    ), then)
+        ), then)
+    }
 
     private fun loadDraft(fields: Map<String, String>, then: () -> Unit) {
         if (mutable.value.saving) return
         val draft = EntryDraft(fields)
-        mutable.value = mutable.value.copy(draft = draft, error = null)
+        mutable.value = mutable.value.copy(draft = draft, actionError = null)
         savedState["draft"] = draft.json()
         viewModelScope.launch { persistDraft(draft) }
         then()
     }
 
-    fun preparePayment(expense: ExpenseRow? = null, instalment: InstalmentRow? = null) {
-        resetDraft("Payment")
-        expense?.let {
-            field("amount", Money.input(it.outstandingPaise)); field("expense", it.id)
-            field("vendor", it.vendorId.orEmpty()); field("description", "Payment for ${it.description}")
+    fun preparePayment(expense: ExpenseRow? = null, instalment: InstalmentRow? = null, then: () -> Unit = {}) {
+        requestDraftReplacement {
+            var draft = EntryDraft.fresh(mutable.value.projectId, "Payment")
+            expense?.let { draft = draft.with("amount", Money.input(it.outstandingPaise)).with("expense", it.id)
+                .with("vendor", it.vendorId.orEmpty()).with("description", "Payment for ${it.description}") }
+            instalment?.let { draft = draft.with("amount", Money.input(it.outstandingPaise)).with("instalment", it.id)
+                .with("vendor", it.vendorId.orEmpty()).with("description", "Payment for ${it.title}") }
+            loadDraft(draft.fields, then)
         }
-        instalment?.let {
-            field("amount", Money.input(it.outstandingPaise)); field("instalment", it.id)
-            field("vendor", it.vendorId.orEmpty()); field("description", "Payment for ${it.title}")
+    }
+
+    fun useSupplier(name: String) {
+        val draft = mutable.value.draft
+        val normalized = name.trim()
+        command("Supplier selected") {
+            val existing = repository.vendors(draft.projectId).first().firstOrNull { it.name.equals(normalized, true) }
+            val vendor = existing ?: VendorInfo(newId(), draft.projectId, normalized)
+            if (existing == null) repository.saveVendor(vendor)
+            require(mutable.value.draft == draft) { "The draft changed. Choose the supplier again." }
+            val updated = draft.with("vendor", vendor.id).with("supplierName", vendor.name)
+            mutable.value = mutable.value.copy(draft = updated)
+            savedState["draft"] = updated.json()
+            persistDraft(updated)
         }
+    }
+
+    fun pauseTimerForReview() {
+        val frozen = finishTimer(mutable.value.draft, System.currentTimeMillis())
+        if (frozen != mutable.value.draft) loadDraft(frozen.fields) { }
     }
 
     fun saveDraft(onSuccess: () -> Unit) {
         if (mutable.value.saving) return
         val draft = finishTimer(mutable.value.draft, System.currentTimeMillis())
         command("Saved successfully") {
-            require(draft.projectId.isNotBlank()) { "Choose a project first." }
+            val projects = repository.projects.first()
+            require(projects.any { it.id == mutable.value.projectId && !it.archived }) { CREATE_PROJECT_MESSAGE }
+            require(projects.any { it.id == draft.projectId && !it.archived }) { "The draft project is unavailable. Move or discard the draft before saving." }
             LocalDate.parse(draft.date)
             persistDraft(draft)
             when (draft.kind) {
@@ -332,11 +597,16 @@ class LedgerViewModel(
                                planned: List<String> = emptyList(), nodes: List<ClassificationInfo> = emptyList()) = EntryDraft(mapOf(
             "id" to row.id, "key" to newId(), "projectId" to row.projectId, "kind" to "Contract",
             "description" to row.title, "amount" to Money.input(row.amountPaise), "originalAmount" to row.amountPaise.toString(),
-            "date" to row.date, "vendor" to row.vendorId.orEmpty(), "revision" to row.revision.toString(),
+            "originalDescription" to row.title, "originalVendor" to row.vendorId.orEmpty(),
+            "date" to row.date, "vendor" to row.vendorId.orEmpty(), "revision" to row.revision.toString(), "note" to row.note,
+            "mode" to if (row.calculationJson.isBlank()) "DIRECT_AMOUNT" else "CALCULATED",
             "originalSchedules" to JSONArray(plans.map { JSONObject().put("id", it.id).put("title", it.title)
                 .put("amount", Money.input(it.amountPaise)).put("date", it.dueDate).put("vendor", it.vendorId.orEmpty())
-                .put("revision", it.revision).put("remind", it.remind).put("paid", it.paidPaise) }).toString()
-        ) + plannedFields(planned, nodes))
+                .put("revision", it.revision).put("remind", it.remind).put("reminderDays", it.reminderDays)
+                .put("paid", it.paidPaise).put("note", it.note) }).toString()
+        ) + plannedFields(planned, nodes) + if (row.calculationJson.isBlank()) emptyMap() else JSONObject(row.calculationJson).let { json ->
+            json.keys().asSequence().associateWith { json.getString(it) }
+        })
 
         fun draftForExpense(expense: ExpenseInput): EntryDraft {
             val nativeInvoice = expense.lines.any { runCatching { JSONObject(it.legacyJson).has("_nativeInvoiceBasePaise") }.getOrDefault(false) }
@@ -445,8 +715,7 @@ class LedgerViewModel(
             } else listOf("WORK", "COST", "PLACE").mapNotNull { dimension ->
                 draft.get(dimension).takeIf { it.isNotBlank() }?.let { ClassificationPart(it, dimension, total) }
             }
-            val paid = draft.get("paid").takeIf { it.isNotBlank() }?.let { Money.parse(it, true) } ?: 0
-            require(paid <= total) { "Paid amount exceeds the final cost." }
+            val paid = paidAmount(draft, total)
             return ExpenseInput(id = draft.id, idempotencyKey = draft.get("key"), projectId = draft.projectId,
                 description = draft.get("description").trim(), amountPaise = total, date = draft.date,
                 vendorId = draft.get("vendor").ifBlank { null }, note = draft.get("note"), mode = if (invoiceDetails != null) "CALCULATED" else draft.get("mode", "DIRECT_AMOUNT"),
@@ -459,6 +728,20 @@ class LedgerViewModel(
                     draft.get("taxPercent", "0").ifBlank { "0" }, draft.get("transport", "0").ifBlank { "0" },
                     draft.get("adjustment", "0").ifBlank { "0" }, draft.get("quantityUnit", "unit"), draft.get("rateUnit", "unit")
                 ) else null, invoiceNumber = draft.get("invoiceNumber").trim())
+        }
+
+        internal fun paidAmount(draft: EntryDraft, total: Long = amount(draft)): Long {
+            val paid = when (draft.get("paidStatus")) {
+                "Full" -> total
+                "Unpaid" -> 0L
+                "Partial" -> Money.parse(draft.get("paid")).also {
+                    require(it < total) { "Partial payment must be less than the final cost. Choose Full to pay it all." }
+                }
+                "" -> draft.get("paid").takeIf { it.isNotBlank() }?.let { Money.parse(it, true) } ?: 0L
+                else -> throw IllegalArgumentException("Choose a valid payment status.")
+            }
+            require(paid <= total) { "Paid amount exceeds the final cost." }
+            return paid
         }
 
         fun payment(draft: EntryDraft) = PaymentInput(id = draft.id, idempotencyKey = draft.get("key"), projectId = draft.projectId,
@@ -477,18 +760,48 @@ class LedgerViewModel(
             title = draft.get("description").trim(), amountPaise = Money.parse(draft.get("amount")), dueDate = draft.date,
             commitmentId = draft.get("commitment").ifBlank { null }, vendorId = draft.get("vendor").ifBlank { null },
             remind = draft.get("remind") == "true", revision = draft.get("revision").toLongOrNull(),
-            classificationIds = plannedIds(draft), reminderDays = draft.get("reminderDays", "3").toInt())
+            classificationIds = plannedIds(draft), reminderDays = draft.get("reminderDays", "3").toInt(), note = draft.get("note"))
+
+        internal fun commitmentScheduleRows(draft: EntryDraft): JSONArray {
+            val editing = draft.get("revision").isNotBlank()
+            val custom = draft.get("schedules")
+            val rows = JSONArray(custom.ifBlank { draft.get("originalSchedules").ifBlank { "[]" } })
+            val originals = JSONArray(draft.get("originalSchedules").ifBlank { "[]" }).let { array ->
+                (0 until array.length()).associate { array.getJSONObject(it).let { row -> row.getString("id") to row } }
+            }
+            val amount = amount(draft)
+            val redistributed = if (editing && custom.isBlank() && rows.length() > 0 &&
+                amount != draft.get("originalAmount").toLong()) {
+                Money.proportional(amount, List(rows.length()) { Money.parse(rows.getJSONObject(it).getString("amount")) })
+            } else null
+            repeat(rows.length()) { index ->
+                val row = rows.getJSONObject(index)
+                redistributed?.let { row.put("amount", Money.input(it[index])) }
+                val value = Money.parse(row.getString("amount"))
+                require(value >= row.optLong("paid", 0)) { "Instalment ${index + 1} cannot be less than its recorded payments. Edit the schedule amounts." }
+                if (editing) {
+                    val originalTitle = draft.get("originalDescription")
+                    if (originalTitle.isNotBlank()) row.put("title", (originals[row.optString("id")]?.optString("title")
+                        ?: row.optString("title")).replaceFirst(originalTitle, draft.get("description").trim()))
+                    if (draft.get("vendor") != draft.get("originalVendor", draft.get("vendor"))) row.put("vendor", draft.get("vendor"))
+                }
+            }
+            return rows
+        }
 
         fun commitment(draft: EntryDraft): CommitmentInput {
-            val amount = Money.parse(draft.get("amount"))
+            val amount = amount(draft)
             val editing = draft.get("revision").isNotBlank()
             val planned = plannedIds(draft)
-            val custom = draft.get("schedules").ifBlank { if (editing && planned != null) draft.get("originalSchedules") else "" }
-            if (editing && custom.isBlank()) require(amount == draft.get("originalAmount").toLong()) {
-                "Edit instalment amounts when changing a commitment total."
+            val rows = commitmentScheduleRows(draft)
+            val originalRows = JSONArray(draft.get("originalSchedules").ifBlank { "[]" })
+            val changed = rows.length() != originalRows.length() || (0 until rows.length()).any { index ->
+                val row = rows.getJSONObject(index)
+                val original = originalRows.getJSONObject(index)
+                listOf("title", "amount", "date", "vendor", "remind", "reminderDays").any { row.opt(it) != original.opt(it) }
             }
-            val schedules = if (custom.isNotBlank()) {
-                val json = JSONArray(custom)
+            val schedules = if (rows.length() > 0 && (!editing || draft.get("schedules").isNotBlank() || changed || planned != null)) {
+                val json = rows
                 List(json.length()) { index -> json.getJSONObject(index).let {
                     val date = it.getString("date"); LocalDate.parse(date)
                     InstalmentInput(it.optString("id").ifBlank { newId() }, draft.projectId,
@@ -497,7 +810,7 @@ class LedgerViewModel(
                         if (editing) it.optString("vendor").ifBlank { null } else draft.get("vendor").ifBlank { null },
                         if (editing) it.optBoolean("remind") else draft.get("remind") == "true",
                         if (editing) it.getLong("revision") else null,
-                        classificationIds = planned)
+                        classificationIds = planned, reminderDays = it.optInt("reminderDays", 3), note = it.optString("note"))
                 } }.also { require(Money.sum(it.map { row -> row.amountPaise }) == amount ||
                     editing && amount == draft.get("originalAmount").toLong() && Money.sum(it.map { row -> row.amountPaise }) < amount) {
                     "Schedule amounts must equal the commitment."
@@ -516,7 +829,11 @@ class LedgerViewModel(
             }
             return CommitmentInput(draft.id, draft.projectId, draft.get("description").trim(), amount, draft.date,
                 draft.get("vendor").ifBlank { null }, schedules, draft.get("revision").toLongOrNull(),
-                classificationIds = planned)
+                classificationIds = planned, note = draft.get("note"), calculation = if (draft.get("mode") == "CALCULATED") DetailedAmount(
+                    draft.get("quantity"), draft.get("rate"), draft.get("multiplier", "1"),
+                    draft.get("discountAmount", "0"), draft.get("discountPercent", "0"), draft.get("taxAmount", "0"),
+                    draft.get("taxPercent", "0"), draft.get("transport", "0"), draft.get("adjustment", "0"),
+                    draft.get("quantityUnit", "unit"), draft.get("rateUnit", "unit")) else null)
         }
 
         fun lineJson(line: ExpenseLineInput) = JSONObject().put("id", line.id).put("description", line.description)
