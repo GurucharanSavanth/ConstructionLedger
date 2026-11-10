@@ -41,10 +41,6 @@ appropriate guide and dated evidence when behavior, commands or verification
 status changes. Preserve original document bytes, financial invariants, audit
 history and recovery evidence. Never commit private records, credentials or keys.
 
-The documentation is tailored to this project's scope using NASA's guidance on
-maintaining document content and verification evidence; it does not claim NASA
-certification or formal compliance. See [NASA documentation guidance](https://swehb.nasa.gov/spaces/SWEHBVB/pages/32604393/SWE-153%2B-%2BETA%2BDefine%2BDocument%2BContent)
-and the [NASA Systems Engineering Handbook](https://www.nasa.gov/reference/systems-engineering-handbook/).
 
 ## Screenshots
 
