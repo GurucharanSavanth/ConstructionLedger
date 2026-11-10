@@ -4,7 +4,7 @@
 
 - Owner authorized committing all pending project changes, merging to main, and pushing both owning Git repositories: native `GurucharanSavanth/ConstructionLedger` and web `GurucharanSavanth/BuildLedger`. Root origin now points to the supplied native repository. Root local development and published source have separate histories; preserve both through a merge, retaining remote-only files and fixes. Do not force-push.
 - Before publication: pinned Node 24.21.0 web suite passed 175/175, no failures/skips (`.tools/publish-web-tests-final.log`). Native build/JVM/targeted-device evidence remains recorded above; no new full-device acceptance or production signing claim. Staged source inventory was checked for private data/configuration paths and common credential markers; none matched. Binary fixtures/screenshots already match published source. `.gitattributes` preserves the protobuf fixture bytes and Gradle launcher line endings; both Gradle launchers retain executable mode.
-- Commit/merge/push verification is pending. Generated outputs, local evidence, databases, environment files and signing material remain excluded.
+- Pending source was committed in each owning repository. Remote main merges were reviewed: the native tree retains the tested local implementation plus the remote license; the web merge adds remote ancestry without changing the tested application source. Gradle launchers remain executable, protobuf fixture bytes are unchanged, and web source hashes were refreshed for all 101 inventoried files. Push/ref verification is in progress. Generated outputs, local evidence, databases, environment files and signing material remain excluded.
 
 ## Sequential release numbering (2026-11-10)
 
