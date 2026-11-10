@@ -16,30 +16,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.io.File
 import java.net.URL
 import java.net.HttpURLConnection
 import java.security.MessageDigest
 
-internal fun newerRelease(remote: String, installed: String): Boolean {
-    fun sequence(value: String): Long? = Regex("v?f\\.(\\d{3,})").matchEntire(value)
-        ?.groupValues?.get(1)?.toLongOrNull()?.takeIf { it > 0 }
-    val nextSequence = sequence(remote)
-    val currentSequence = sequence(installed)
-    if (nextSequence != null) return if (currentSequence != null) nextSequence > currentSequence
-        else Regex("v?\\d+\\.\\d+\\.\\d+").matches(installed)
-    if (currentSequence != null) return false
-    fun parts(value: String): List<Long>? = Regex("v?(\\d+)\\.(\\d+)\\.(\\d+)").matchEntire(value)
-        ?.groupValues?.drop(1)?.map { it.toLongOrNull() ?: return null }
-    val next = parts(remote) ?: return false
-    val current = parts(installed) ?: return false
-    return next.zip(current).firstOrNull { it.first != it.second }?.let { it.first > it.second } ?: false
-}
-
 private const val RELEASES = "https://api.github.com/repos/GurucharanSavanth/ConstructionLedger/releases/latest"
 private const val MAX_APK = 250L * 1024 * 1024
-private data class AppRelease(val tag: String, val url: String, val size: Long, val digest: String)
+internal data class AppRelease(val tag: String, val url: String, val size: Long, val digest: String, val versionName: String = "")
+private val updateDownloadMutex = Mutex()
 
 private fun connection(address: String): HttpURLConnection {
     val url = URL(address)
@@ -91,14 +79,18 @@ private fun signers(info: PackageInfo): Set<String> = (if (Build.VERSION.SDK_INT
 @Suppress("DEPRECATION")
 private fun version(info: PackageInfo) = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
 
+internal fun newerUpdatePackage(candidate: PackageInfo, installed: PackageInfo): Boolean {
+    check(candidate.packageName == installed.packageName) { "Update belongs to another application" }
+    check(signers(candidate).isNotEmpty() && signers(candidate) == signers(installed)) { "Update signing key differs from installed application" }
+    return version(candidate) > version(installed)
+}
+
 private suspend fun latest(context: Context): AppRelease? = withContext(Dispatchers.IO) {
     val bytes = java.io.ByteArrayOutputStream()
     download(RELEASES, 2L * 1024 * 1024) { buffer, count -> bytes.write(buffer, 0, count) }
     val release = JSONObject(bytes.toString("UTF-8"))
     check(!release.getBoolean("draft") && !release.getBoolean("prerelease")) { "Release is not stable" }
-    val installed = context.packageManager.getPackageInfo(context.packageName, 0)
     val tag = release.getString("tag_name")
-    if (!newerRelease(tag, installed.versionName.orEmpty())) return@withContext null
     val assets = release.getJSONArray("assets")
     val apks = (0 until assets.length()).map { assets.getJSONObject(it) }.filter { it.getString("name").endsWith(".apk", true) }
     check(apks.size == 1) { "Release must contain exactly one universal signed APK" }
@@ -107,30 +99,38 @@ private suspend fun latest(context: Context): AppRelease? = withContext(Dispatch
     check(size in 1..MAX_APK) { "Invalid update size" }
     val digest = asset.optString("digest")
     check(Regex("sha256:[a-fA-F0-9]{64}").matches(digest)) { "Release has no SHA-256 digest" }
-    AppRelease(tag, asset.getString("browser_download_url"), size, digest.substringAfter(':'))
+    val available = AppRelease(tag, asset.getString("browser_download_url"), size, digest.substringAfter(':'))
+    val (_, candidate) = verifiedUpdateDownload(context, available)
+    val installed = context.packageManager.getPackageInfo(context.packageName, packageFlags())
+    if (!newerUpdatePackage(candidate, installed)) return@withContext null
+    available.copy(versionName = candidate.versionName ?: version(candidate).toString())
 }
 
-private suspend fun prepare(context: Context, release: AppRelease): File = withContext(Dispatchers.IO) {
+internal suspend fun verifiedUpdateDownload(context: Context, release: AppRelease): Pair<File, PackageInfo> = withContext(Dispatchers.IO) { updateDownloadMutex.withLock {
+    check(release.size in 1..MAX_APK && Regex("[a-fA-F0-9]{64}").matches(release.digest)) { "Invalid update metadata" }
     val directory = File(context.cacheDir, "updates").apply { mkdirs() }
-    val file = File(directory, "update.apk")
-    try {
+    val file = File(directory, "${release.digest.lowercase()}.apk")
+    fun digest(): String = file.inputStream().use { input ->
         val hash = MessageDigest.getInstance("SHA-256")
-        file.outputStream().use { output -> download(release.url, release.size) { buffer, count ->
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
             hash.update(buffer, 0, count)
-            output.write(buffer, 0, count)
-        } }
+        }
+        hash.digest().joinToString("") { "%02x".format(it) }
+    }
+    try {
+        if (!file.isFile || file.length() != release.size || !digest().equals(release.digest, true)) {
+            file.outputStream().use { output -> download(release.url, release.size) { buffer, count -> output.write(buffer, 0, count) } }
+        }
         check(file.length() == release.size) { "Incomplete update download" }
-        check(hash.digest().joinToString("") { "%02x".format(it) }.equals(release.digest, true)) { "Update checksum mismatch" }
+        check(digest().equals(release.digest, true)) { "Update checksum mismatch" }
         val manager = context.packageManager
         val candidate = manager.getPackageArchiveInfo(file.path, packageFlags()) ?: error("Invalid APK")
-        val installed = manager.getPackageInfo(context.packageName, packageFlags())
-        check(candidate.packageName == context.packageName) { "Update belongs to another application" }
-        check(version(candidate) > version(installed)) { "Update version code must increase" }
-        check(signers(candidate).isNotEmpty() && signers(candidate) == signers(installed)) { "Update signing key differs from installed application" }
-        check(candidate.versionName == release.tag.removePrefix("v")) { "APK version differs from release tag" }
-        file
+        file to candidate
     } catch (error: Exception) { file.delete(); throw error }
-}
+} }
 
 @Composable
 internal fun AppUpdates(manual: Boolean = false) {
@@ -139,7 +139,6 @@ internal fun AppUpdates(manual: Boolean = false) {
     var checked by rememberSaveable { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var release by remember { mutableStateOf<AppRelease?>(null) }
-    var ready by remember { mutableStateOf<File?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
     fun check(showResult: Boolean) {
         if (busy) return
@@ -156,14 +155,15 @@ internal fun AppUpdates(manual: Boolean = false) {
     LaunchedEffect(Unit) { if (!manual && !checked) { checked = true; check(false) } }
     if (manual) TextButton({ check(true) }, enabled = !busy) { Text(if (busy) "Checking updates…" else "Check for updates") }
     release?.let { update -> AlertDialog(
-        onDismissRequest = { if (!busy) { release = null; ready = null } },
-        title = { Text("BuildLedger ${update.tag} available") },
-        text = { Text(if (busy) "Downloading and verifying update…" else "Download the signed update from GitHub. Android will ask you to approve installation. Your ledger stays on this device.") },
+        onDismissRequest = { if (!busy) release = null },
+        title = { Text("BuildLedger ${update.versionName} available") },
+        text = { Text(if (busy) "Preparing and verifying update…" else "The signed update is ready. Android will ask you to approve installation. Your ledger stays on this device.") },
         confirmButton = { TextButton(enabled = !busy, onClick = {
             busy = true
             scope.launch {
                 try {
-                    val apk = ready ?: prepare(context, update).also { ready = it }
+                    val (apk, candidate) = verifiedUpdateDownload(context, update)
+                    check(newerUpdatePackage(candidate, context.packageManager.getPackageInfo(context.packageName, packageFlags()))) { "Update version code must increase" }
                     if (!context.packageManager.canRequestPackageInstalls()) {
                         message = "Allow updates from BuildLedger, return here, then tap Install update."
                         context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")))
@@ -172,14 +172,13 @@ internal fun AppUpdates(manual: Boolean = false) {
                         context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
                             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
                         release = null
-                        ready = null
                     }
                 } catch (cancelled: CancellationException) { throw cancelled }
-                catch (error: Exception) { message = "Update failed: ${error.message}"; ready = null }
+                catch (error: Exception) { message = "Update failed: ${error.message}" }
                 finally { busy = false }
             }
-        }) { Text(if (ready == null) "Download update" else "Install update") } },
-        dismissButton = { TextButton({ release = null; ready = null }, enabled = !busy) { Text("Later") } }
+        }) { Text("Install update") } },
+        dismissButton = { TextButton({ release = null }, enabled = !busy) { Text("Later") } }
     ) }
     message?.let { text -> AlertDialog(onDismissRequest = { message = null }, title = { Text("App updates") },
         text = { Text(text) }, confirmButton = { TextButton({ message = null }) { Text("OK") } }) }
