@@ -558,6 +558,7 @@ internal fun SettingsScreen(vm: LedgerViewModel, actions: UiActions) {
                 vm.repository.saveProject(selected.copy(name = name.trim(), budgetPaise = budget.takeIf { it.isNotBlank() }?.let { Money.parse(it, true) }))
             } }, enabled = !state.saving) { Text("Save project settings") }
         } }
+        item { AppUpdates(manual = true) }
         item { Toggle("Local schedule reminders", state.reminders, { vm.settings(reminders = it); actions.setReminders(it) }) }
         item { Toggle("Show archived categories", state.showArchived, { vm.settings(showArchived = it) }) }
     }

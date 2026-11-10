@@ -32,6 +32,7 @@ import java.time.LocalDate
 @Composable
 fun BuildLedgerApp(repository: LedgerRepository, actions: UiActions, preferences: DataStore<Preferences>? = null) {
     val context = LocalContext.current.applicationContext
+    AppUpdates()
     val vm: LedgerViewModel = viewModel(factory = remember(repository) {
         object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
