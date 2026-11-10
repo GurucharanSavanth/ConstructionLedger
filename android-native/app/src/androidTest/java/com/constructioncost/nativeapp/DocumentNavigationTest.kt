@@ -52,6 +52,11 @@ class DocumentNavigationTest {
     }
     @get:Rule(order = 1) val compose = createAndroidComposeRule<MainActivity>()
 
+    private fun showSavedDocuments() {
+        compose.waitUntil(10_000) { compose.onAllNodes(hasScrollToNodeAction()).fetchSemanticsNodes().size == 1 }
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Saved documents"))
+    }
+
     @Test fun keptPhotoCanBeKeptThenImportedAfterRecreation() = runBlocking<Unit> {
         val captures = CameraCaptures(context)
         val photo = captures.create("photo-${java.util.UUID.randomUUID()}.jpg")
@@ -83,8 +88,10 @@ class DocumentNavigationTest {
             compose.onAllNodesWithText("Keep for later").fetchSemanticsNodes().takeIf { it.isNotEmpty() }?.let {
                 compose.onNodeWithText("Keep for later").performClick()
             }
+            showSavedDocuments()
             compose.waitUntil(10_000) { compose.onAllNodesWithText(photo.name, substring = false).fetchSemanticsNodes().isNotEmpty() }
             compose.activityRule.scenario.recreate()
+            showSavedDocuments()
             compose.waitUntil(10_000) { compose.onAllNodesWithText(photo.name, substring = false).fetchSemanticsNodes().isNotEmpty() }
             org.junit.Assert.assertEquals(originalHash, DocumentPolicy.sha256(store.fileFor(saved)))
         } finally {
@@ -96,6 +103,7 @@ class DocumentNavigationTest {
     @Test fun viewerReturnsToDocumentDetailAfterToolbarBackBackDispatcherAndRecreation() {
         compose.waitUntil(30_000) { compose.onAllNodesWithText("Project overview").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Files").performClick()
+        showSavedDocuments()
         compose.waitUntil(5_000) { compose.onAllNodesWithText(attachment.name).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText(attachment.name).performClick()
         val draft = listOf("Category" to "Custom category", "Status" to "Draft status", "Revision label" to "Draft revision",
