@@ -5,6 +5,7 @@ import android.net.Uri
 import com.constructioncost.nativeapp.data.local.LedgerRecoveryStateStore
 import java.io.File
 import java.io.InputStream
+import java.io.IOException
 import java.io.OutputStream
 import java.nio.file.Files
 import java.security.MessageDigest
@@ -63,6 +64,7 @@ object DocumentPolicy {
         while (true) {
             val read = input.read(buffer)
             if (read < 0) break
+            if (read == 0) throw IOException("Document stream stopped returning data")
             count += read
             require(count <= limit) { "Document exceeds the $limit byte limit" }
             output.write(buffer, 0, read)

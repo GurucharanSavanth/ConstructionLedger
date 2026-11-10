@@ -49,12 +49,72 @@ class NativeReplicaTest {
         compose.onNodeWithText("Explore").performClick()
         compose.waitUntil(10_000) { compose.onAllNodesWithText("Cost explorer").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Cost explorer").assertExists()
-        compose.onNodeWithText("Cost Heads").assertExists()
+        compose.onNodeWithContentDescription("Explore by: Cost Heads").assertExists()
         screenshot("explore")
         compose.onNodeWithText("Activity").performClick()
         compose.waitUntil(10_000) { compose.onAllNodesWithContentDescription("Search supplier, item, category, invoice or room...").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithContentDescription("Search supplier, item, category, invoice or room...").assertExists()
         screenshot("activity")
+    }
+
+    @Test fun exploreSearchAndSortRemainAvailableAcrossViews() {
+        start()
+        compose.onNodeWithText("Explore").performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithContentDescription("Explore by: Cost Heads").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithContentDescription("Search this view").performTextInput("no matching category")
+        compose.onNodeWithText("No matches").assertExists()
+        compose.onNodeWithText("Clear search").performClick()
+        compose.onNodeWithContentDescription("Sort by: Highest cost").performClick()
+        compose.onNodeWithText("Name A–Z").performClick()
+        compose.onNodeWithContentDescription("Sort by: Name A–Z").assertExists()
+        compose.onNodeWithContentDescription("Explore by: Cost Heads").performClick()
+        compose.onNodeWithText("Cost Nature").performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithContentDescription("Explore by: Cost Nature").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithContentDescription("Search this view").assertExists()
+        compose.onNodeWithContentDescription("Sort by: Name A–Z").assertExists()
+    }
+
+    @Test fun existingExpenseCanBeEditedAndReviewed() {
+        start()
+        runBlocking { repository.saveExpense(ExpenseInput(id="edit-test",projectId="default-project",description="Edit test bill",amountPaise=10000,paidPaise=4000,date="2026-10-01")) }
+        compose.onNodeWithText("Activity").performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithContentDescription("Search supplier, item, category, invoice or room...").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(30_000) {
+            runCatching { compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Edit test bill")); true }.getOrDefault(false)
+        }
+        compose.onNodeWithText("Edit test bill").performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Edit expense").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Edit expense").performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Edit direct cost").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Description").performTextClearance()
+        compose.onNodeWithText("Description").performTextInput("Updated bill")
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Categories and bill number", substring=true))
+        compose.onNodeWithText("Categories and bill number", substring=true).performClick()
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Review changes"))
+        compose.onNodeWithText("Review changes").performClick()
+        compose.onNodeWithText("Recorded bill cost: ${Money.format(10000L)}. Existing payments remain separate.").assertExists()
+        compose.onNodeWithText("Save entry").performClick()
+        compose.waitUntil(10_000) { runBlocking { repository.expense("edit-test")?.description == "Updated bill" } }
+        assertEquals(10000L,runBlocking { repository.expense("edit-test")!!.amountPaise })
+        assertEquals(4000L,runBlocking { repository.summary("default-project").first().paidPaise })
+    }
+
+    @Test fun explorerDrillDownKeepsTheResultsInViewAndPreservesAmounts() {
+        start()
+        runBlocking { repository.saveExpense(ExpenseInput(id="drill-bill",projectId="default-project",description="Survey bill",amountPaise=12345,date="2026-10-01",
+            classifications=listOf(ClassificationPart("default-project:cost-01-02","COST",12345)))) }
+        compose.onNodeWithText("Explore").performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithContentDescription("Explore by: Cost Heads").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Planning Expenses"))
+        compose.onNodeWithText("Planning Expenses").performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Site survey and measurement").fetchSemanticsNodes().isNotEmpty() &&
+            runCatching { compose.onNodeWithText("Site survey and measurement").assertIsDisplayed(); true }.getOrDefault(false) }
+        compose.onNodeWithText("Site survey and measurement").assertIsDisplayed()
+        compose.onNodeWithText("‹ Back to previous level").assertIsDisplayed()
+        compose.onNodeWithText("‹ Back to previous level").performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Planning Expenses").fetchSemanticsNodes().isNotEmpty() }
+        assertEquals(12345L,runBlocking { repository.summary("default-project").first().recordedPaise })
+        assertEquals(0L,runBlocking { repository.summary("default-project").first().paidPaise })
     }
 
     private fun screenshot(name:String) {
@@ -160,7 +220,7 @@ class NativeReplicaTest {
         assertEquals(listOf("settled"),completed.map{it.id})
         assertEquals(0L,repository.summary("default-project").first().recordedPaise)
         val audit=AuditInfo("audit","expenses","bill","EDIT","{\"amountPaise\":10000,\"description\":\"Cement\"}","{\"amountPaise\":12500,\"description\":\"Cement\"}",0)
-        val change=readableAuditChanges(audit).single()
+        val change=readableAuditChanges(audit).changes.single()
         assertEquals("Amount",change.label)
         assertEquals("₹100",change.before)
         assertEquals("₹125",change.after)

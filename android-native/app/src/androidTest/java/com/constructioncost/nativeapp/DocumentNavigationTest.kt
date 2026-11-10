@@ -64,6 +64,7 @@ class DocumentNavigationTest {
         try {
             compose.waitUntil(30_000) { compose.onAllNodesWithText("Project overview").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Files").performClick()
+            compose.waitUntil(10_000) { compose.onAllNodesWithText("Kept camera photos").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Kept camera photos").performClick()
             compose.waitUntil(10_000) { compose.onAllNodesWithText("Discard photo $number").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Discard photo $number").performScrollTo().performClick()

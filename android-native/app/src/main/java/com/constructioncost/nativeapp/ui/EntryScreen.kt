@@ -54,8 +54,12 @@ internal fun EntryScreen(vm: LedgerViewModel, actions: UiActions, saved: () -> U
     val staleProject = draft.projectId != state.projectId && projects.none { it.id == draft.projectId }
     val change: (String, String) -> Unit = { key, value -> vm.field(key, value) }
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(vertical = 16.dp)) {
-        item { PageHeading(if (editing) "Edit entry" else webEntryChoices.firstOrNull { it.kind == draft.kind }?.title ?: "Add Entry",
-            webEntryChoices.firstOrNull { it.kind == draft.kind }?.description ?: "Enter the details, then review before saving.") }
+        item { PageHeading(if (editing) "Edit ${draft.kind.lowercase()}" else webEntryChoices.firstOrNull { it.kind == draft.kind }?.title ?: "Add Entry",
+            if (editing) "Change what you need. Review changes before saving." else webEntryChoices.firstOrNull { it.kind == draft.kind }?.description ?: "Enter the details, then review before saving.") }
+        if (editing) item { WebCard(color = WebColors.blueSoft) {
+            Text("Your saved entry stays unchanged until you confirm.", style = MaterialTheme.typography.bodyMedium)
+            Text("Open the sections below only when you need them.", color = WebColors.muted, style = MaterialTheme.typography.bodyMedium)
+        } }
         if (draft.projectId != state.projectId) item {
             if (projects.any { it.id == draft.projectId }) {
                 Text("This retained draft belongs to a different project. Saving keeps it in its original project.", color = MaterialTheme.colorScheme.error)
@@ -81,6 +85,7 @@ internal fun EntryScreen(vm: LedgerViewModel, actions: UiActions, saved: () -> U
             item { DateField(if (draft.kind in listOf("Plan", "Contract")) "Due / first schedule date" else "Date", draft.date, { change("date", it) }) }
             if (draft.kind != "Work log") item { SupplierField(vm, draft, vendors, change) }
             if (cost) item {
+                @Composable fun ClassificationFields() {
                 CostClassificationFields(vm, project, draft, classes, change)
                 ClassificationChoice(vm, project, "Work stage", draft.get("WORK"),
                     classes.filter { kindDimension(it.kind) == "WORK" && (!it.archived || it.id == draft.get("WORK")) }.map { it.id to classificationPath(it, classes) },
@@ -89,6 +94,8 @@ internal fun EntryScreen(vm: LedgerViewModel, actions: UiActions, saved: () -> U
                     classes.filter { it.kind == "PLACE" && (!it.archived || it.id == draft.get("PLACE")) }.map { it.id to it.name },
                     classes, "PLACE", choose = { change("PLACE", it); change("classesChanged", "true") })
                 Field("Bill number (optional)", draft.get("invoiceNumber"), { change("invoiceNumber", it) })
+                }
+                if (editing) Section("Categories and bill number") { ClassificationFields() } else ClassificationFields()
             }
             if (cost && !editing) item {
                 Choice("Payment status", draft.get("paidStatus", "Unpaid"), listOf("Unpaid" to "Not paid yet", "Partial" to "Partly paid", "Full" to "Paid in full"), { status ->
@@ -209,11 +216,18 @@ internal fun EntryScreen(vm: LedgerViewModel, actions: UiActions, saved: () -> U
                 }
             }
             if (cost || draft.kind == "Payment") item {
+                @Composable fun PaymentReferenceFields() {
                 Choice("Payment method", draft.get("method", "UPI"), listOf("UPI", "Bank transfer", "Cash", "Cheque").map { it to it }, { change("method", it) }, allowNone = false)
                 Field("Payment reference (optional)", draft.get("reference"), { change("reference", it) })
+                }
+                if (editing) Section("Payment reference") { PaymentReferenceFields() } else PaymentReferenceFields()
             }
-            item { Field("Notes", draft.get("note"), { change("note", it) }, multiline = true) }
+            item {
+                if (editing) Section("Notes") { Field("Notes", draft.get("note"), { change("note", it) }, multiline = true) }
+                else Field("Notes", draft.get("note"), { change("note", it) }, multiline = true)
+            }
             if (cost || draft.kind == "Payment") item {
+                @Composable fun DocumentFields() {
                 Text("Attach bills / files (optional)")
                 OutlinedButton({ actions.importDocument(project) }) { Text("Choose file") }
                 actions.capturePhoto?.let { capture -> OutlinedButton({ capture(project) }) { Text("Take photo with camera") } }
@@ -225,6 +239,8 @@ internal fun EntryScreen(vm: LedgerViewModel, actions: UiActions, saved: () -> U
                     TextButton({ actions.viewDocument(file) }) { Text("View ${file.name}") }
                     TextButton({ change("attachments", (selected - file.id).joinToString(",")) }) { Text("Unlink ${file.name}") }
                 }
+                }
+                if (editing) Section("Documents") { DocumentFields() } else DocumentFields()
             }
             state.actionError?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
             item {
@@ -254,7 +270,7 @@ internal fun EntryScreen(vm: LedgerViewModel, actions: UiActions, saved: () -> U
                             }
                         } else { if(draft.kind == "Work log") vm.pauseTimerForReview(); review = true }
                     } catch (error: Exception) { vm.showError(error.message ?: "Check the amount and date.") }
-                }, Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = !state.saving && !staleProject && !reviewing && (draft.kind != "Payment" || loadedExpenses != null)) { Text(if (state.saving) "Saving…" else if (reviewing) "Checking invoice…" else "Review and save") }
+                }, Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = !state.saving && !staleProject && !reviewing && (draft.kind != "Payment" || loadedExpenses != null)) { Text(if (state.saving) "Saving…" else if (reviewing) "Checking invoice…" else if (editing) "Review changes" else "Review and save") }
                 TextButton({ discard = true }, Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = !state.saving) { Text("Discard draft") }
             }
         }
@@ -267,7 +283,7 @@ internal fun EntryScreen(vm: LedgerViewModel, actions: UiActions, saved: () -> U
     if (review) {
         val amount = runCatching { if (cost || draft.kind == "Contract") LedgerViewModel.amount(draft) else Money.parse(draft.get("amount")) }.getOrNull()
         val paid = runCatching { LedgerViewModel.paidAmount(draft) }.getOrDefault(0)
-        AlertDialog(onDismissRequest = { if (!state.saving) review = false }, title = { Text("Review entry") }, text = {
+        AlertDialog(onDismissRequest = { if (!state.saving) review = false }, title = { Text(if (editing) "Review changes" else "Review entry") }, text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(draft.get("description")); Text("Date: ${draft.date}")
                 if (draft.get("invoiceNumber").isNotBlank()) Text("Invoice reference: ${draft.get("invoiceNumber")}")
@@ -277,6 +293,7 @@ internal fun EntryScreen(vm: LedgerViewModel, actions: UiActions, saved: () -> U
                 }
                 if (amount != null) Text("Amount: ${Money.format(amount)}")
                 Text(when {
+                    cost && editing -> "Recorded bill cost: ${amount?.let(Money::format)}. Existing payments remain separate."
                     cost -> "Recorded cost ${amount?.let(Money::format)}; cash ${Money.format(paid)}; remaining ${amount?.let { Money.format(it - paid) }}."
                     draft.kind == "Payment" -> "Posts cash. Any amount without an expense allocation remains an advance."
                     draft.kind in listOf("Plan", "Contract") -> "Future obligation only. Recorded cost and cash do not change."

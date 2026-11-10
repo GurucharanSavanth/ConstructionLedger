@@ -37,7 +37,20 @@ internal object ProjectWorkbookExport {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) Trace.beginAsyncSection("BuildLedgerProjectXlsxExport", traceCookie)
             try {
                 onProgress("Writing project workbook")
-                ProjectWorkbookWriter.write(workbook, project, attachments) { consume -> repository.forEachExportRow(projectId, consume) }
+                ProjectWorkbookWriter.write(workbook, project, attachments) { consume ->
+                    var projectSeen = false
+                    var budget: Long? = null
+                    repository.forEachExportRow(projectId) { table, row ->
+                        if (table == "projects") {
+                            check(row.getString("name") == project.name && row.getLong("revision") == project.revision &&
+                                row.getBoolean("archived") == project.archived) { "Project changed while preparing export. Please retry." }
+                            projectSeen = true
+                        }
+                        if (table == "budgets") budget = row.getLong("amountPaise")
+                        consume(table, row)
+                    }
+                    check(projectSeen && budget == project.budgetPaise) { "Project changed while preparing export. Please retry." }
+                }
                 val entries = mutableListOf<ExportFile>()
                 var packageFiles = emptyList<ExportFile>()
                 ZipOutputStream(FileOutputStream(output)).use { zip ->

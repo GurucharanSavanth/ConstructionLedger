@@ -4,10 +4,26 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.io.InputStream
 import java.nio.file.Files
 import java.util.UUID
 
 class DocumentPolicyTest {
+    @Test fun boundedCopyRejectsAStreamThatStopsMakingProgress() {
+        val source = object : InputStream() {
+            var reads = 0
+            override fun read(): Int = -1
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int = when (reads++) {
+                0 -> { buffer[offset] = 42; 1 }
+                1 -> 0
+                else -> -1
+            }
+        }
+        val output = ByteArrayOutputStream()
+        assertThrows(IOException::class.java) { DocumentPolicy.copy(source, output) }
+        assertArrayEquals(byteArrayOf(42), output.toByteArray())
+    }
     @Test fun archiveCleanupRemovesOnlyOldOwnedStagingAndCandidateFiles() {
         val directory = Files.createTempDirectory("archive-cleanup-test").toFile()
         try {

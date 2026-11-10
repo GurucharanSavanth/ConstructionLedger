@@ -17,6 +17,20 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class ReadModelsTest {
+    @Test fun searchesTreatSqlWildcardsAsLiteralText() = runBlocking<Unit> {
+        val repository = LedgerRepository.inMemory(InstrumentationRegistry.getInstrumentation().targetContext)
+        try {
+            repository.saveProject(ProjectInfo("project", "Build"))
+            repository.saveExpense(ExpenseInput(id = "literal", projectId = "project", description = "Tax 5% item_!", amountPaise = 12345, date = "2026-10-23"))
+            repository.saveExpense(ExpenseInput(id = "plain", projectId = "project", description = "Tax 50 item other", amountPaise = 67890, date = "2026-10-23"))
+            for (search in listOf("%", "_", "!")) {
+                assertEquals(listOf("literal"), repository.expenses("project", ExpenseFilter(query = search)).first().map { it.id })
+                assertEquals(listOf("literal"), repository.activity("project", query = search).first().filter { it.type == "EXPENSE" }.map { it.id })
+            }
+            assertEquals(listOf("literal"), repository.projectAudits("project", search = "%").first()
+                .filter { it.recordType == "expenses" }.map { it.recordId })
+        } finally { repository.close() }
+    }
     @Test fun streamedInspectionAndReplacementReportBoundedRecordProgress() = runBlocking<Unit> {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val database = Room.inMemoryDatabaseBuilder(context, LedgerDatabase::class.java).build()

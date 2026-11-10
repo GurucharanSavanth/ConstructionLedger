@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { packSnapshot, archiveFormatTest, emptyState } from './convert-legacy-archive.mjs';
+import { packSnapshot, unpackSnapshot, archiveFormatTest, emptyState } from './convert-legacy-archive.mjs';
 import { mapLegacy, convertArchive, convertFile, decryptNative, encryptNative, MAX_INPUT } from './convert-legacy.mjs';
 
 const password='fixture-password-123',nativePassword='native-fixture-password-123',now=1767312000000;
@@ -26,6 +26,68 @@ function fixture() {
     return {state,assets:[{id:'pdf1',blob:new Blob([bytes],{type:'application/pdf'})}]};
 }
 const archive=async f=>Buffer.from(await (await packSnapshot(f.state,f.assets,password)).arrayBuffer());
+
+function centralEntries(zip) {
+    const end=zip.length-22, count=zip.readUInt16LE(end+10), entries=new Map();
+    let pos=zip.readUInt32LE(end+16);
+    for(let i=0;i<count;i++) {
+        assert.equal(zip.readUInt32LE(pos),0x02014b50);
+        const len=zip.readUInt16LE(pos+28),extra=zip.readUInt16LE(pos+30),comment=zip.readUInt16LE(pos+32);
+        entries.set(zip.toString('utf8',pos+46,pos+46+len),pos); pos+=46+len+extra+comment;
+    }
+    return entries;
+}
+
+test('aliased encrypted ZIP entries are rejected before conversion',async()=> {
+    const f=fixture(); f.state.files.push({...f.state.files[0],id:'pdf2'}); f.assets.push({id:'pdf2',blob:f.assets[0].blob});
+    const entries=archiveFormatTest.zipParse(await archive(f)),header=JSON.parse(entries.get('header.json'));
+    header.objects[1].iv=header.objects[0].iv;
+    entries.set('header.json',Buffer.from(JSON.stringify(header)));
+    const zip=Buffer.from(await archiveFormatTest.zipCreate(entries).arrayBuffer()),cd=centralEntries(zip);
+    const first=cd.get('objects/pdf1.enc'),second=cd.get('objects/pdf2.enc');
+    zip.writeUInt32LE(zip.readUInt32LE(first+42),second+42);
+    zip.writeUInt32LE(zip.readUInt32LE(first+16),second+16);
+    await assert.rejects(convertArchive(zip,password,nativePassword,now),/overlap/i);
+});
+
+test('separate encrypted entries with identical document bytes still convert',async()=> {
+    const f=fixture(); f.state.files.push({...f.state.files[0],id:'pdf2'}); f.assets.push({id:'pdf2',blob:f.assets[0].blob});
+    const result=await convertArchive(await archive(f),password,nativePassword,now);
+    const zip=archiveFormatTest.zipParse(decryptNative(result.encrypted,nativePassword));
+    assert.deepEqual(Buffer.from(zip.get('files/pdf1')),Buffer.from(zip.get('files/pdf2')));
+    assert.equal(result.manifest.files.length,2);
+});
+
+test('partially overlapping local records are rejected and adjacent empty entries remain valid',async()=> {
+    const payload=Buffer.from('same content');
+    const inner=Buffer.from(await archiveFormatTest.zipCreate([['inner',payload]]).arrayBuffer());
+    const innerRecord=inner.subarray(0,inner.readUInt32LE(inner.length-6));
+    const zip=Buffer.from(await archiveFormatTest.zipCreate([['outer',innerRecord],['inner',payload]]).arrayBuffer());
+    const cd=centralEntries(zip),outerLocal=zip.readUInt32LE(cd.get('outer')+42);
+    const outerBody=outerLocal+30+zip.readUInt16LE(outerLocal+26)+zip.readUInt16LE(outerLocal+28);
+    zip.writeUInt32LE(outerBody,cd.get('inner')+42);
+    assert.throws(()=>archiveFormatTest.zipParse(zip),/overlap/i);
+    const normal=Buffer.from(await archiveFormatTest.zipCreate([['empty-a',Buffer.alloc(0)],['empty-b',Buffer.alloc(0)],['a',payload],['b',payload]]).arrayBuffer());
+    const parsed=archiveFormatTest.zipParse(normal);
+    assert.equal(parsed.size,4); assert.deepEqual(Buffer.from(parsed.get('a')),Buffer.from(parsed.get('b')));
+});
+
+test('unpacker rejects repeated object references that exceed the plaintext budget before retaining assets',async()=> {
+    const f=fixture(),payload=Buffer.alloc(1024*1024,65),sha=digest(payload);
+    f.state.files=[{...f.state.files[0],id:'asset0',name:'Asset.bin',type:'application/octet-stream',size:payload.length,sha256:sha}];
+    f.assets=[{id:'asset0',blob:new Blob([payload])}];
+    const entries=archiveFormatTest.zipParse(await archive(f)),header=JSON.parse(entries.get('header.json'));
+    const template=header.objects[0];
+    f.state.files=Array.from({length:65},(_,i)=>({...f.state.files[0],id:`asset${i}`}));
+    header.objects=f.state.files.map(meta=>({...template,id:meta.id}));
+    const plain=Buffer.from(JSON.stringify(f.state)),key=await archiveFormatTest.keyFor(password,archiveFormatTest.fromB64(header.salt));
+    const encrypted=await archiveFormatTest.encrypt(plain,key);
+    header.database={iv:encrypted.iv,sha256:digest(plain)}; entries.set('state.enc',encrypted.bytes);
+    entries.set('header.json',Buffer.from(JSON.stringify(header)));
+    const zip=await archiveFormatTest.zipCreate(entries); let retained=0;
+    await assert.rejects(unpackSnapshot(zip,password,()=>retained++),/plaintext.*limit/i);
+    assert.equal(retained,0);
+});
 
 test('complex fixture preserves native mapping, grouped settlements, evidence and encrypted output',async()=> {
     const f=fixture(),input=await archive(f),result=await convertArchive(input,password,nativePassword,now),r=result.records;

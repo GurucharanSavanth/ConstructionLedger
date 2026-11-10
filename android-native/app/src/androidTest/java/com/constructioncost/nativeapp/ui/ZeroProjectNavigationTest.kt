@@ -73,6 +73,7 @@ class ZeroProjectNavigationTest {
             }
         }
         compose.waitUntil(5_000) { compose.onAllNodesWithText(CREATE_PROJECT_MESSAGE).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Start your project").assertExists()
 
         for (tab in listOf("Add Entry", "Activity", "Files", "Explore", "Home")) {
             compose.onNodeWithText(tab, substring = false).performClick()

@@ -320,7 +320,11 @@ internal fun ProjectsScreen(vm: LedgerViewModel, actions: UiActions) {
     val visible = projects.filter { "${it.name} ${it.id}".contains(search.trim(), ignoreCase = true) }
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item { Title("Projects") }
-        item { if (!state.hasActiveProject) Text(CREATE_PROJECT_MESSAGE, color = WebColors.muted) }
+        item { if (!state.hasActiveProject) WebCard(color = WebColors.blueSoft) {
+            Text("Start your project", style = MaterialTheme.typography.titleLarge)
+            Text(CREATE_PROJECT_MESSAGE, color = WebColors.muted)
+            Text(if (projects.isEmpty()) "Give it a name to begin. You can add a budget now or later." else "Select an active project or create a new one.", color = WebColors.muted)
+        } }
         item { Section(if (id.isBlank()) "Add project" else "Edit project", expandedInitially = projects.isEmpty()) {
             Field("Project name", name, { name = it })
             Field("Budget (₹, optional)", budget, { budget = it }, numeric = true)
@@ -343,7 +347,7 @@ internal fun ProjectsScreen(vm: LedgerViewModel, actions: UiActions) {
             } }, enabled = !state.saving) { Text(if (projects.isEmpty()) "Create Project" else "Save project") }
             if (id.isNotBlank()) TextButton({ id = ""; name = ""; budget = ""; archived = false }, enabled = !state.saving) { Text("Cancel edit") }
         } }
-        item { Field("Search projects", search, { search = it }) }
+        if (projects.isNotEmpty()) item { Field("Search projects", search, { search = it }) }
         items(visible, key = { it.id }) { project ->
             RecordCard(project.name, "${if (project.id == state.projectId) "Selected" else if (project.archived) "Archived" else "Tap to select"} · ID ${project.id.take(8)}",
                 project.budgetPaise?.let(Money::format)) { if (!project.archived) vm.selectProject(project.id) }

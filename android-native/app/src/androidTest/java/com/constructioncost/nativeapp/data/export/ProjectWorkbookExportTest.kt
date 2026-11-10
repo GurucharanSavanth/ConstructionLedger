@@ -10,10 +10,12 @@ import com.constructioncost.nativeapp.domain.ProjectInfo
 import com.constructioncost.nativeapp.platform.files.AttachmentStore
 import com.constructioncost.nativeapp.platform.files.DocumentPolicy
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.first
 import org.json.JSONObject
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
@@ -28,6 +30,47 @@ class ProjectWorkbookExportTest {
     private fun assertWellFormedXml(value: String) {
         val parser = Xml.newPullParser().apply { setInput(StringReader(value)) }
         while (parser.next() != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) { }
+    }
+
+    @Test fun projectPackageRejectsProjectMetadataChangedBeforeSnapshot() = runBlocking<Unit> {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val repository = LedgerRepository.inMemory(context)
+        var generated: File? = null
+        try {
+            repository.saveProject(ProjectInfo("p", "Before", 10_000))
+            repository.saveExpense(ExpenseInput(id = "bill", projectId = "p", description = "Invoice", amountPaise = 321, date = "2026-10-23"))
+            assertThrows(IllegalStateException::class.java) {
+                runBlocking {
+                    generated = ProjectWorkbookExport.create(context.cacheDir, repository, AttachmentStore(context, repository), "p") { phase ->
+                        if (phase == "Writing project workbook") runBlocking {
+                            repository.saveProject(ProjectInfo("p", "After", 20_000, revision = 0))
+                        }
+                    }
+                }
+            }
+            assertEquals(20_000L, repository.projects.first().single().budgetPaise)
+            assertEquals(321L, repository.summary("p").first().recordedPaise)
+        } finally { generated?.delete(); repository.close() }
+    }
+
+    @Test fun projectPackageRetainsConsistentSnapshotWhenProjectChangesAfterRowsRead() = runBlocking<Unit> {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val repository = LedgerRepository.inMemory(context)
+        var generated: File? = null
+        try {
+            repository.saveProject(ProjectInfo("p", "Before", 10_000))
+            generated = ProjectWorkbookExport.create(context.cacheDir, repository, AttachmentStore(context, repository), "p") { phase ->
+                if (phase == "Verifying completed project package") runBlocking {
+                    repository.saveProject(ProjectInfo("p", "After", 20_000, revision = 0))
+                }
+            }
+            ZipFile(requireNotNull(generated)).use { archive ->
+                val manifest = JSONObject(archive.getInputStream(archive.getEntry("export-manifest.json")).bufferedReader().use { it.readText() })
+                assertEquals("Before", manifest.getJSONObject("project").getString("name"))
+                assertEquals(10_000L, manifest.getJSONObject("project").getLong("budgetPaise"))
+            }
+            assertEquals(20_000L, repository.projects.first().single().budgetPaise)
+        } finally { generated?.delete(); repository.close() }
     }
 
     @Test fun workbookKeepsExactPaiseTextFormulaSafeRowsAndProjectReconciliation() = runBlocking<Unit> {

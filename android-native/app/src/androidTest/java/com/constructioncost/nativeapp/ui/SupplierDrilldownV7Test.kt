@@ -48,7 +48,8 @@ class SupplierDrilldownV7Test {
         compose.setContent { BuildLedgerApp(repository, actions, preferences.preferences.store) }
         compose.waitUntil(10_000) { compose.onAllNodesWithText("Project overview").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Explore", substring = false).performClick()
-        compose.waitUntil(10_000) { compose.onAllNodesWithText("Supplier", substring = false).fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(10_000) { compose.onAllNodesWithContentDescription("Explore by: Cost Heads").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithContentDescription("Explore by: Cost Heads").performClick()
         compose.onNodeWithText("Supplier", substring = false).performClick()
         compose.waitUntil(10_000) { compose.onAllNodesWithText("Unknown supplier").fetchSemanticsNodes().isNotEmpty() }
         compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Unknown supplier", substring = false))
@@ -58,7 +59,7 @@ class SupplierDrilldownV7Test {
                 .fetchSemanticsNodes().isNotEmpty()
         }
         compose.onNodeWithContentDescription("Filter activities: Bills and purchases").assertExists()
-        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Showing", substring = true))
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Loading activity") or hasText("Showing", substring = true))
         compose.waitUntil(10_000) { compose.onAllNodesWithText("Showing 1 records").fetchSemanticsNodes().isNotEmpty() }
         compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("No supplier invoice", substring = false))
         compose.onNodeWithText("No supplier invoice", substring = false).assertExists()

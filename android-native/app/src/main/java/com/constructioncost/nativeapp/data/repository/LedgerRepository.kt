@@ -43,6 +43,8 @@ private val sqliteBinaryTextOrder = Comparator<String> { left, right ->
     if (comparison == 0) a.size.compareTo(b.size) else comparison
 }
 
+private fun likeNeedle(value: String) = "%" + value.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+
 data class SnapshotFinancials(val recordedPaise: BigInteger, val paidPaise: BigInteger, val outstandingPaise: BigInteger)
 data class SnapshotInfo(val counts: Map<String, Int>, val attachments: List<AttachmentInfo>, val financials: SnapshotFinancials? = null)
 internal data class ProjectDeletionFile(val id: String, val storageName: String, val size: Long, val sha256: String)
@@ -265,8 +267,8 @@ class LedgerRepository internal constructor(private val database: LedgerDatabase
         val args = mutableListOf<Any?>(projectId)
         val conditions = mutableListOf("e.projectId=?")
         if (filter.query.isNotBlank()) {
-            conditions += "(e.description LIKE ? OR e.note LIKE ? OR e.invoiceNumber LIKE ? OR v.name LIKE ? OR EXISTS(SELECT 1 FROM expense_lines l WHERE l.expenseId=e.id AND (l.description LIKE ? OR l.legacyJson LIKE ? OR l.nature LIKE ?)) OR EXISTS(SELECT 1 FROM classification_allocations a JOIN classifications c ON c.id=a.classificationId WHERE a.expenseId=e.id AND c.name LIKE ?))"
-            repeat(8) { args += "%${filter.query}%" }
+            conditions += "(e.description LIKE ? ESCAPE '!' OR e.note LIKE ? ESCAPE '!' OR e.invoiceNumber LIKE ? ESCAPE '!' OR v.name LIKE ? ESCAPE '!' OR EXISTS(SELECT 1 FROM expense_lines l WHERE l.expenseId=e.id AND (l.description LIKE ? ESCAPE '!' OR l.legacyJson LIKE ? ESCAPE '!' OR l.nature LIKE ? ESCAPE '!')) OR EXISTS(SELECT 1 FROM classification_allocations a JOIN classifications c ON c.id=a.classificationId WHERE a.expenseId=e.id AND c.name LIKE ? ESCAPE '!'))"
+            repeat(8) { args += likeNeedle(filter.query) }
         }
         if (filter.fromDate.isNotBlank()) { date(filter.fromDate); conditions += "e.date>=?"; args += filter.fromDate }
         if (filter.toDate.isNotBlank()) { date(filter.toDate); conditions += "e.date<=?"; args += filter.toDate }
@@ -334,7 +336,7 @@ class LedgerRepository internal constructor(private val database: LedgerDatabase
         val order = if (sortByRecordedTime) "$recordedTime DESC,event.type,event.id" else "event.date DESC,event.id,event.type"
         val cursorCondition = if (before == null) "" else " AND ($recordedTime<? OR ($recordedTime=? AND (event.type>? OR (event.type=? AND event.id>?))))"
         val cursorArgs = before?.let { listOf<Any?>(it.recordedAt,it.recordedAt,it.type,it.type,it.id) }.orEmpty()
-        val needle = "%${query.trim()}%"
+        val needle = likeNeedle(query.trim())
         val matching = expenseFilter?.let { expenseWhere(projectId,it) }
         val prefix = matching?.let { "${SETTLEMENT.replace("WITH ", "WITH RECURSIVE ")}${it.tree}, matchingExpenses AS (SELECT e.id FROM expenses e LEFT JOIN vendors v ON v.id=e.vendorId LEFT JOIN settlement s ON s.expenseId=e.id WHERE ${it.clause}) " }.orEmpty()
         val expenseCondition = if(matching==null) "" else " AND (event.type<>'EXPENSE' OR event.id IN (SELECT id FROM matchingExpenses))"
@@ -356,7 +358,7 @@ class LedgerRepository internal constructor(private val database: LedgerDatabase
                 FROM commitments c LEFT JOIN vendors v ON v.id=c.vendorId WHERE c.projectId=?
             UNION ALL SELECT d.id,'ATTACHMENT',d.name,date(d.createdAt/1000,'unixepoch','localtime'),NULL,'',${recorded("attachments", "d")} FROM attachments d WHERE d.projectId=?
             ) event WHERE (?='' OR event.date>=?) AND (?='' OR event.date<=?)
-                AND (?='' OR event.title LIKE ? OR event.vendorName LIKE ? OR event.type LIKE ? ${if(matching!=null) "OR event.type='EXPENSE'" else ""})
+                AND (?='' OR event.title LIKE ? ESCAPE '!' OR event.vendorName LIKE ? ESCAPE '!' OR event.type LIKE ? ESCAPE '!' ${if(matching!=null) "OR event.type='EXPENSE'" else ""})
                 AND (? IS NULL OR event.type=?) $expenseCondition $statusCondition $cursorCondition ORDER BY $order LIMIT ? OFFSET ?""",
             *((matching?.args.orEmpty()) + listOf(projectId, if (includeExpenses) 1 else 0, projectId, projectId, projectId, projectId, projectId,
             fromDate, fromDate, toDate, toDate, query.trim(), needle, needle, needle, recordType, recordType) + cursorArgs + listOf(limit, offset)).toTypedArray()))
@@ -437,7 +439,7 @@ class LedgerRepository internal constructor(private val database: LedgerDatabase
         if (fromDate.isNotBlank()) date(fromDate)
         if (toDate.isNotBlank()) date(toDate)
         require(fromDate.isBlank() || toDate.isBlank() || fromDate <= toDate)
-        val needle = "%${search.trim()}%"
+        val needle = likeNeedle(search.trim())
         val auditOwner = json("_auditProjectId" to projectId).toString().removePrefix("{").removeSuffix("}")
         val recordOwner = json("projectId" to projectId).toString().removePrefix("{").removeSuffix("}")
         val cursorCondition = if (before == null) "" else " AND (createdAt<? OR (createdAt=? AND ('AUDIT'>? OR ('AUDIT'=? AND id>?))))"
@@ -452,7 +454,7 @@ class LedgerRepository internal constructor(private val database: LedgerDatabase
             AND NOT (recordType='classifications' AND action='SAVE' AND beforeJson='null'
                 AND (instr(recordId,?)=1 OR instr(recordId,?)=1 OR instr(recordId,?)=1))
             AND NOT (recordType='projects' AND recordId='default-project' AND action='SAVE' AND beforeJson='null')
-            AND (?='' OR recordType LIKE ? OR action LIKE ? OR beforeJson LIKE ? OR afterJson LIKE ?)
+            AND (?='' OR recordType LIKE ? ESCAPE '!' OR action LIKE ? ESCAPE '!' OR beforeJson LIKE ? ESCAPE '!' OR afterJson LIKE ? ESCAPE '!')
             AND (?='' OR date(createdAt/1000,'unixepoch','localtime')>=?)
             AND (?='' OR date(createdAt/1000,'unixepoch','localtime')<=?)
             $cursorCondition ORDER BY createdAt DESC,id LIMIT ?""",*(listOf<Any?>(auditOwner,auditOwner,recordOwner,recordOwner,projectId,projectId,"$projectId:cost-","$projectId:work:","$projectId:place:",
@@ -1515,12 +1517,21 @@ class LedgerRepository internal constructor(private val database: LedgerDatabase
         valid("SELECT e.id FROM expenses e LEFT JOIN commitments c ON c.id=e.commitmentId LEFT JOIN instalments i ON i.id=e.instalmentId WHERE (c.id IS NOT NULL AND (e.projectId!=c.projectId OR (e.vendorId IS NOT NULL AND c.vendorId IS NOT NULL AND e.vendorId!=c.vendorId))) OR (i.id IS NOT NULL AND (e.projectId!=i.projectId OR (e.vendorId IS NOT NULL AND i.vendorId IS NOT NULL AND e.vendorId!=i.vendorId)))", "Invalid expense reference")
         valid("SELECT p.id FROM payments p JOIN instalments i ON i.id=p.instalmentId WHERE p.projectId!=i.projectId OR (p.vendorId IS NOT NULL AND i.vendorId IS NOT NULL AND p.vendorId!=i.vendorId)", "Invalid payment schedule reference")
         valid("SELECT l.id FROM attachment_links l JOIN attachments a ON a.id=l.attachmentId LEFT JOIN expenses e ON e.id=l.expenseId LEFT JOIN payments p ON p.id=l.paymentId LEFT JOIN activity_entries n ON n.id=l.noteId WHERE (l.expenseId IS NOT NULL)+(l.paymentId IS NOT NULL)+(l.noteId IS NOT NULL)!=1 OR (e.id IS NOT NULL AND e.projectId!=a.projectId) OR (p.id IS NOT NULL AND p.projectId!=a.projectId) OR (n.id IS NOT NULL AND n.projectId!=a.projectId)", "Invalid attachment link")
-        rows("SELECT * FROM classifications").forEach { node ->
-            val parent = node.nullable("parentId")?.let { row("classifications", it) }
+        val classifications = rows("SELECT id,parentId,projectId,kind FROM classifications").associateBy { it.getString("id") }
+        classifications.values.forEach { node ->
+            val parent = node.nullable("parentId")?.let { classifications[it] }
             require(node.getString("kind") in KINDS && (parent == null || parent.getString("projectId") == node.getString("projectId"))) { "Invalid classification" }
             checkParent(node.getString("kind"), parent?.getString("kind"))
-            var next = node.nullable("parentId"); val visited = mutableSetOf(node.getString("id"))
-            while (next != null) { require(visited.add(next)) { "Classification cycle" }; next = row("classifications", next)?.nullable("parentId") }
+        }
+        val checkedClassifications = mutableSetOf<String>()
+        classifications.keys.forEach { start ->
+            val visited = mutableSetOf<String>()
+            var next: String? = start
+            while (next != null && next !in checkedClassifications) {
+                require(visited.add(next)) { "Classification cycle" }
+                next = classifications[next]?.nullable("parentId")
+            }
+            checkedClassifications.addAll(visited)
         }
     }
     // Check a consistent snapshot and the connection that enforces settings on writes.

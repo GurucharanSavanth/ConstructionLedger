@@ -85,7 +85,64 @@ async function encrypt(data,key){const iv=crypto.getRandomValues(new Uint8Array(
 async function decrypt(data,key,iv){try{return new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:fromB64(iv)},key,data))}catch{throw Error('Incorrect password or damaged backup archive.')}}
 const crcTable=Array.from({length:256},(_,i)=>{let c=i;for(let j=0;j<8;j++)c=c&1?0xedb88320^(c>>>1):c>>>1;return c>>>0});function crc32(b){let c=0xffffffff;for(const k of b)c=crcTable[(c^k)&255]^(c>>>8);return(c^0xffffffff)>>>0}
 function put16(d,o,v){d.setUint16(o,v,true)}function put32(d,o,v){d.setUint32(o,v,true)}function zipCreate(entries){const blobs=[],meta=[];let pos=0;for(const [name,data] of entries){const filename=enc.encode(name),b=data instanceof Uint8Array?data:enc.encode(data);if(b.length>0xffffffff||pos>0xffffffff)throw Error('Backup too large for this version of ZIP.');const header=new Uint8Array(30+filename.length),v=new DataView(header.buffer);put32(v,0,0x04034b50);put16(v,4,20);put16(v,6,0x800);put16(v,8,0);const crc=crc32(b);put32(v,14,crc);put32(v,18,b.length);put32(v,22,b.length);put16(v,26,filename.length);header.set(filename,30);blobs.push(header,b);meta.push({name:filename,crc,size:b.length,pos});pos+=header.length+b.length}const central=[];let cdSize=0;for(const m of meta){const h=new Uint8Array(46+m.name.length),v=new DataView(h.buffer);put32(v,0,0x02014b50);put16(v,4,20);put16(v,6,20);put16(v,8,0x800);put16(v,10,0);put32(v,16,m.crc);put32(v,20,m.size);put32(v,24,m.size);put16(v,28,m.name.length);put32(v,42,m.pos);h.set(m.name,46);central.push(h);cdSize+=h.length}const end=new Uint8Array(22),e=new DataView(end.buffer);put32(e,0,0x06054b50);put16(e,8,meta.length);put16(e,10,meta.length);put32(e,12,cdSize);put32(e,16,pos);return new Blob([...blobs,...central,end],{type:'application/zip'})}
-function zipParse(data){if(data.byteLength>LIMIT)throw Error('Backup exceeds the safe browser import limit (850 MB).');const b=data instanceof Uint8Array?data:new Uint8Array(data),v=new DataView(b.buffer,b.byteOffset,b.byteLength);let end=-1;for(let p=b.length-22;p>=Math.max(0,b.length-65557);p--){if(v.getUint32(p,true)===0x06054b50){end=p;break}}if(end<0)throw Error('This is not a valid BuildLedger ZIP.');const count=v.getUint16(end+10,true),off=v.getUint32(end+16,true),out=new Map();if(count>10000)throw Error('Archive contains too many entries.');let pos=off;for(let i=0;i<count;i++){if(pos+46>b.length||v.getUint32(pos,true)!==0x02014b50)throw Error('Damaged archive index.');const flags=v.getUint16(pos+8,true),method=v.getUint16(pos+10,true),crc=v.getUint32(pos+16,true),size=v.getUint32(pos+20,true),len=v.getUint16(pos+28,true),ex=v.getUint16(pos+30,true),com=v.getUint16(pos+32,true),local=v.getUint32(pos+42,true);if(method!==0||!(flags&0x800))throw Error('Unsupported ZIP format.');const name=dec.decode(b.subarray(pos+46,pos+46+len));if(out.has(name)||name.includes('..')||name.startsWith('/')||name.includes('\\'))throw Error('Unsafe archive entry names.');if(local+30>b.length||v.getUint32(local,true)!==0x04034b50)throw Error('Damaged archive entry.');const start=local+30+v.getUint16(local+26,true)+v.getUint16(local+28,true);if(start+size>b.length)throw Error('Truncated archive entry.');const body=b.subarray(start,start+size);if(crc32(body)!==crc)throw Error('Corrupt backup archive (checksum mismatch).');out.set(name,body);pos+=46+len+ex+com}return out}
+function zipParse(data){
+    if(data.byteLength>LIMIT)throw Error('Backup exceeds the safe browser import limit (850 MB).');
+    const b=data instanceof Uint8Array?data:new Uint8Array(data),v=new DataView(b.buffer,b.byteOffset,b.byteLength);
+    let end=-1; for(let p=b.length-22;p>=Math.max(0,b.length-65557);p--){if(v.getUint32(p,true)===0x06054b50){end=p;break}}
+    if(end<0)throw Error('This is not a valid BuildLedger ZIP.');
+    const count=v.getUint16(end+10,true),off=v.getUint32(end+16,true),out=new Map(),ranges=[];
+    if(count>10000)throw Error('Archive contains too many entries.');
+    if(off>end)throw Error('Damaged archive index.');
+    let pos=off;
+    for(let i=0;i<count;i++){
+        if(pos+46>end||v.getUint32(pos,true)!==0x02014b50)throw Error('Damaged archive index.');
+        const flags=v.getUint16(pos+8,true),method=v.getUint16(pos+10,true),crc=v.getUint32(pos+16,true),size=v.getUint32(pos+20,true),len=v.getUint16(pos+28,true),ex=v.getUint16(pos+30,true),com=v.getUint16(pos+32,true),local=v.getUint32(pos+42,true);
+        if(pos+46+len+ex+com>end)throw Error('Damaged archive index.');
+        if(method!==0||!(flags&0x800))throw Error('Unsupported ZIP format.');
+        const name=dec.decode(b.subarray(pos+46,pos+46+len));
+        if(out.has(name)||name.includes('..')||name.startsWith('/')||name.includes('\\'))throw Error('Unsafe archive entry names.');
+        if(local+30>off||v.getUint32(local,true)!==0x04034b50)throw Error('Damaged archive entry.');
+        const start=local+30+v.getUint16(local+26,true)+v.getUint16(local+28,true);
+        if(start>off||size>off-start)throw Error('Truncated archive entry.');
+        ranges.push([local,start+size]); out.set(name,{body:b.subarray(start,start+size),crc});
+        pos+=46+len+ex+com;
+    }
+    ranges.sort((a,b)=>a[0]-b[0]);
+    for(let i=1;i<ranges.length;i++)if(ranges[i][0]<ranges[i-1][1])throw Error('Overlapping archive entries.');
+    for(const [name,entry] of out){if(crc32(entry.body)!==entry.crc)throw Error('Corrupt backup archive (checksum mismatch).');out.set(name,entry.body)}
+    return out;
+}
 export async function packSnapshot(state,files,password,progress=()=>{}){verifyState(state);const found=new Map(files.map(f=>[f.id,f]));for(const m of state.files)if(!found.has(m.id))throw Error('Cannot back up because an original file is missing: '+m.name);const total=files.reduce((a,f)=>a+(f.blob?.size||0),0);if(total>LIMIT)throw Error('The document vault exceeds this browser version’s 850 MB safe export limit. Use smaller archives or a dedicated storage backend.');const salt=crypto.getRandomValues(new Uint8Array(16)),key=await keyFor(password,salt),entries=[];const dbPlain=enc.encode(JSON.stringify(state));const db=await encrypt(dbPlain,key);let head={product:'BuildLedger',format:1,encrypted:true,kdf:'PBKDF2-SHA256',iterations:250000,salt:b64(salt),database:{iv:db.iv,sha256:await digest(dbPlain)},objects:[]};entries.push(['state.enc',db.bytes]);for(let i=0;i<state.files.length;i++){const meta=state.files[i],source=found.get(meta.id);const bytes=await bytesOf(source.blob);const hash=await digest(bytes);if(hash!==meta.sha256)throw Error('File checksum mismatch: '+meta.name);const crypt=await encrypt(bytes,key);const path=`objects/${meta.id}.enc`;head.objects.push({id:meta.id,path,iv:crypt.iv,sha256:hash,size:bytes.length,type:meta.type||'application/octet-stream'});entries.push([path,crypt.bytes]);progress(i+1,state.files.length)}entries.unshift(['header.json',enc.encode(JSON.stringify(head))]);let archive=zipCreate(entries);if(archive.size>LIMIT)throw Error('Archive is too large to safely export in this browser.');return archive}
-export async function unpackSnapshot(file,password,progress=()=>{}){const entries=zipParse(new Uint8Array(await file.arrayBuffer()));const headerData=entries.get('header.json');if(!headerData)throw Error('Not a BuildLedger backup');const h=JSON.parse(dec.decode(headerData));if(h.product!=='BuildLedger'||h.format!==1||h.encrypted!==true||!Array.isArray(h.objects))throw Error('Unsupported BuildLedger backup format');const key=await keyFor(password,fromB64(h.salt));const dbData=entries.get('state.enc');if(!dbData)throw Error('Backup database missing');const dbRaw=await decrypt(dbData,key,h.database.iv);if(await digest(dbRaw)!==h.database.sha256)throw Error('Database checksum mismatch');const state=JSON.parse(dec.decode(dbRaw));verifyState(state);if(h.objects.length!==state.files.length)throw Error('Backup does not contain every original file');let assets=[];const byId=new Map(h.objects.map(o=>[o.id,o]));if(byId.size!==h.objects.length)throw Error('Duplicate backup asset');for(let i=0;i<state.files.length;i++){const meta=state.files[i],m=byId.get(meta.id);if(!m||!entries.has(m.path)||m.sha256!==meta.sha256)throw Error('Missing original document: '+meta.name);if(typeof meta.type!=='string'||(m.type!==meta.type&&m.type!=='application/octet-stream'))throw Error('Document content-type mismatch: '+meta.name);const plain=await decrypt(entries.get(m.path),key,m.iv);if(plain.length!==m.size||plain.length!==meta.size||await digest(plain)!==m.sha256)throw Error('Document checksum mismatch: '+meta.name);assets.push({id:meta.id,blob:new Blob([plain],{type:meta.type||'application/octet-stream'})});progress(i+1,state.files.length)}return {state,assets}}
+export async function unpackSnapshot(file,password,progress=()=>{}){
+    const entries=zipParse(new Uint8Array(await file.arrayBuffer()));
+    const headerData=entries.get('header.json');if(!headerData)throw Error('Not a BuildLedger backup');
+    const h=JSON.parse(dec.decode(headerData));
+    if(h.product!=='BuildLedger'||h.format!==1||h.encrypted!==true||!Array.isArray(h.objects))throw Error('Unsupported BuildLedger backup format');
+    const dbData=entries.get('state.enc');if(!dbData)throw Error('Backup database missing');
+    const maxPlaintext=64*1024*1024;
+    if(dbData.length<16||dbData.length-16>maxPlaintext)throw Error('Backup plaintext exceeds the 64 MiB limit.');
+    let totalPlaintext=dbData.length-16;
+    const key=await keyFor(password,fromB64(h.salt));
+    const dbRaw=await decrypt(dbData,key,h.database.iv);
+    if(await digest(dbRaw)!==h.database.sha256)throw Error('Database checksum mismatch');
+    const state=JSON.parse(dec.decode(dbRaw));verifyState(state);
+    if(h.objects.length!==state.files.length)throw Error('Backup does not contain every original file');
+    const byId=new Map(h.objects.map(o=>[o.id,o]));if(byId.size!==h.objects.length)throw Error('Duplicate backup asset');
+    const pending=state.files.map(meta=>{
+        const m=byId.get(meta.id);
+        if(!m||!entries.has(m.path)||m.sha256!==meta.sha256)throw Error('Missing original document: '+meta.name);
+        if(typeof meta.type!=='string'||(m.type!==meta.type&&m.type!=='application/octet-stream'))throw Error('Document content-type mismatch: '+meta.name);
+        const cipher=entries.get(m.path);
+        if(cipher.length<16||cipher.length-16>maxPlaintext-totalPlaintext)throw Error('Backup plaintext exceeds the 64 MiB limit.');
+        totalPlaintext+=cipher.length-16;
+        return {meta,m,cipher};
+    });
+    const assets=[];
+    for(let i=0;i<pending.length;i++){
+        const {meta,m,cipher}=pending[i],plain=await decrypt(cipher,key,m.iv);
+        if(plain.length!==m.size||plain.length!==meta.size||await digest(plain)!==m.sha256)throw Error('Document checksum mismatch: '+meta.name);
+        assets.push({id:meta.id,blob:new Blob([plain],{type:meta.type||'application/octet-stream'})});progress(i+1,state.files.length);
+    }
+    return {state,assets};
+}
 export const archiveFormatTest={zipCreate,zipParse,encrypt,decrypt,keyFor,b64,fromB64,digest};

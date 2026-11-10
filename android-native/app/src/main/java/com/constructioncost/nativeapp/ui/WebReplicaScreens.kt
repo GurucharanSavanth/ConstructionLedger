@@ -7,6 +7,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -54,6 +57,11 @@ internal fun WebHomeScreen(vm: LedgerViewModel,activity: (ExpenseFilter) -> Unit
                 Button({ navigate("entry") }) { Text("+ New entry") }
             }
         }
+        if (recent.isEmpty() && billTotals.count == 0 && plans.isEmpty()) item { WebCard(color=WebColors.blueSoft) {
+            Text("Your project is ready",style=MaterialTheme.typography.titleLarge)
+            Text("Start with a bill or purchase. You can add details and documents as you go.",color=WebColors.muted)
+            Button({ navigate("entry") }) { Text("Add your first entry") }
+        } }
         item {
             Column(verticalArrangement=Arrangement.spacedBy(10.dp)) {
                 Row(horizontalArrangement=Arrangement.spacedBy(10.dp),modifier=Modifier.height(IntrinsicSize.Max)) {
@@ -243,51 +251,70 @@ internal fun WebExploreScreen(vm:LedgerViewModel,activity:(ExpenseFilter)->Unit,
     var dimension by rememberSaveable(project) { mutableStateOf("COST") }
     var parent by rememberSaveable(project) { mutableStateOf<String?>(null) }
     var levelQuery by rememberSaveable(project,tab,parent) { mutableStateOf("") }
+    var sort by rememberSaveable(project) { mutableStateOf("highest") }
+    val listState = rememberLazyListState()
+    var navigatingLevel by remember { mutableStateOf(false) }
     @Composable fun Header() {
         Column(Modifier.padding(horizontal=16.dp,vertical=24.dp),verticalArrangement=Arrangement.spacedBy(15.dp)) {
-            PageHeading("Cost explorer","A clear path from project totals to the original invoice.")
-            OutlinedButton({ tab="calendar" }) { Text("Payment calendar") }
-            WebTabs(listOf("cost" to "Cost Heads","nature" to "Cost Nature","hierarchy" to "Stages & materials","work" to "Work stage","place" to "Location","vendor" to "Supplier","material" to "Material","calendar" to "Calendar"),tab) {
+            PageHeading("Cost explorer","Browse recorded costs and open original bills.")
+            Choice("Explore by",tab,listOf("cost" to "Cost Heads","nature" to "Cost Nature","hierarchy" to "Stages & materials","work" to "Work stage","place" to "Location","vendor" to "Supplier","material" to "Material","calendar" to "Calendar"),{
                 tab=it;parent=null;dimension=when(it){"cost"->"COST";"place"->"PLACE";"vendor"->"SUPPLIER";"material"->"MATERIAL";else->"WORK"}
-            }
+            },allowNone=false)
         }
     }
     if(tab=="calendar") {
         CalendarScreen(vm,{navigate("entry-form")},detail,{ Header() },enableReminders)
         return
     }
-    val rows = remember(project,parent,dimension) { vm.repository.insights(project,parent,dimension) }.readLedger(vm) ?: return StartupScreen("Loading saved records")
+    val rows = remember(project,parent,dimension) { vm.repository.insights(project,parent,dimension) }.readLedger(vm)
+    LaunchedEffect(parent, navigatingLevel, rows) {
+        if (navigatingLevel && rows != null) {
+            withFrameNanos { }
+            listState.animateScrollToItem(2)
+            navigatingLevel = false
+        }
+    }
     val classes = remember(project) { vm.repository.classifications(project) }.readLedger(vm) ?: return StartupScreen("Loading saved records")
     val monthly = remember(project) { vm.repository.monthlyCash(project) }.readLedger(vm) ?: return StartupScreen("Loading saved records")
     val nature = remember(project) { vm.repository.costNature(project) }.readLedger(vm) ?: return StartupScreen("Loading saved records")
-    val comparison=insightComparison(rows)
-    LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(bottom=24.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
+    val comparison=insightComparison(rows.orEmpty())
+    val visibleRows=exploreResults(rows.orEmpty(),levelQuery,sort,{it.name},{it.amountPaise}).filter { it.amountPaise>0 || tab=="cost" }
+    val visibleNature=exploreResults(nature,levelQuery,sort,{it.nature.ifBlank { "Unclassified / Legacy" }},{it.amountPaise})
+    LazyColumn(Modifier.fillMaxSize(),state=listState,contentPadding=PaddingValues(bottom=24.dp),verticalArrangement=Arrangement.spacedBy(16.dp)) {
             item { Header() }
+            item { WebCard {
+                Field("Search this view",levelQuery,{levelQuery=it},showLabel=false)
+                if(levelQuery.isNotEmpty()) TextButton({levelQuery=""}) { Text("Clear search") }
+                Choice("Sort by",sort,listOf("highest" to "Highest cost", "lowest" to "Lowest cost", "name" to "Name A–Z"),{sort=it},allowNone=false)
+            } }
             if(tab=="nature") item { WebCard {
                 Text("Cost by nature",style=MaterialTheme.typography.titleLarge)
                 if(nature.isEmpty()) EmptyPanel("Nothing recorded yet","Add a purchase or bill to see the cost breakdown.")
-                nature.forEachIndexed { i,row -> CostBar(row.nature.ifBlank { "Unclassified / Legacy" },row.amountPaise,Money.sum(nature.map{it.amountPaise}),i) { activity(ExpenseFilter(costNature=row.nature.ifBlank {"Unclassified / Legacy"},postedOnly=true)) } }
+                else if(visibleNature.isEmpty()) EmptyPanel("No matches","Try another search.")
+                visibleNature.forEachIndexed { i,row -> CostBar(row.nature.ifBlank { "Unclassified / Legacy" },row.amountPaise,Money.sum(nature.map{it.amountPaise}),i) { activity(ExpenseFilter(costNature=row.nature.ifBlank {"Unclassified / Legacy"},postedOnly=true)) } }
             } }
+            else if(rows == null) item { WebCard { Text("Loading this level…") } }
             else {
                 if(tab !in listOf("cost","hierarchy") && comparison.totalPaise>0) item { WebCard { Eyebrow("RECORDED BILL COSTS");InsightDonut(comparison) { row ->
                     activity(when(dimension){"SUPPLIER"->ExpenseFilter(vendorId=row.id,missingVendor=row.id==null,postedOnly=true);"MATERIAL"->ExpenseFilter(materialName=row.name,postedOnly=true);else->ExpenseFilter(classificationId=row.id,postedOnly=true)})
                 } } }
-                item { WebCard {
+                item { WebCard(modifier=Modifier.animateContentSize(animationSpec=tween(220))) {
                     Text(if(tab=="hierarchy") "Construction cost explorer" else if(tab=="cost") "Cost head explorer" else "Category ranking",style=MaterialTheme.typography.titleLarge)
                     Text(if(tab=="cost") "Cost Head → Subhead → Item / Service → Original Bill" else if(tab=="hierarchy") "Select a stage to see its substages, materials, and original bills." else "Recorded invoices only. Payments, advances and future plans are kept separate.",color=WebColors.muted,style=MaterialTheme.typography.bodyMedium)
                     if(tab in listOf("cost","hierarchy")) OutlinedButton({navigate("categories")}) {Text("+ Categories")}
                     if(tab in listOf("cost","hierarchy")) {
-                        OutlinedButton({parent=classes.firstOrNull { it.id==parent }?.parentId}) { Text(classes.firstOrNull { it.id==parent }?.name ?: "All cost heads") }
+                        if (parent != null) TextButton({parent=classes.firstOrNull { it.id==parent }?.parentId; navigatingLevel=true}) { Text("‹ Back to previous level") }
+                        Text(classes.firstOrNull { it.id==parent }?.let { classificationPath(it,classes) } ?: if(tab=="cost") "All cost heads" else "All stages",style=MaterialTheme.typography.titleMedium)
                         WebCard(color=WebColors.soft) {
                             Text(Money.format(comparison.totalPaise),fontSize=20.sp,fontWeight=FontWeight.Bold)
                             Text("Recorded bill cost · Payments and plans excluded",color=WebColors.muted,style=MaterialTheme.typography.bodyMedium)
                         }
-                        Field("Filter this level",levelQuery,{levelQuery=it},modifier=Modifier.fillMaxWidth(.55f),showLabel=false)
                     } else Text(Money.format(comparison.totalPaise),fontSize=28.sp,fontWeight=FontWeight.Bold)
                     if(rows.none {it.amountPaise>0}) EmptyPanel("No recorded costs","Add a bill or classify an existing bill.")
-                    rows.filter {(it.amountPaise>0 || tab=="cost") && it.name.contains(levelQuery,true)}.sortedByDescending { it.amountPaise }.forEachIndexed { i,row ->
+                    if(levelQuery.isNotBlank() && visibleRows.isEmpty()) EmptyPanel("No matches","Try another search or level.")
+                    visibleRows.forEachIndexed { i,row ->
                         CostBar(row.name,row.amountPaise,comparison.totalPaise,i) {
-                            if(row.id!=null && row.kind!="DIRECT_ALLOCATION" && dimension !in listOf("SUPPLIER","MATERIAL") && classes.any { it.parentId==row.id }) parent=row.id
+                            if(row.id!=null && row.kind!="DIRECT_ALLOCATION" && dimension !in listOf("SUPPLIER","MATERIAL") && classes.any { it.parentId==row.id }) { parent=row.id; navigatingLevel=true }
                             else activity(when(dimension){"SUPPLIER"->ExpenseFilter(vendorId=row.id,missingVendor=row.id==null,postedOnly=true);"MATERIAL"->ExpenseFilter(materialName=row.name,postedOnly=true);else->if(row.id==null) ExpenseFilter(status=when(dimension){"WORK"->"UNCLASSIFIED_WORK";"PLACE"->"UNCLASSIFIED_PLACE";else->"UNCLASSIFIED"}) else ExpenseFilter(classificationId=row.id,directClassification=row.kind=="DIRECT_ALLOCATION")})
                         }
                     }
@@ -296,4 +323,15 @@ internal fun WebExploreScreen(vm:LedgerViewModel,activity:(ExpenseFilter)->Unit,
                 if(tab !in listOf("cost","hierarchy")) item { WebCard { MonthlyCashChart(monthly) } }
             }
         }
+}
+
+internal fun <T> exploreResults(rows: List<T>, query: String, sort: String, name: (T) -> String, amount: (T) -> Long): List<T> {
+    val terms = query.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+    val matches = rows.filter { row -> terms.all { name(row).contains(it, ignoreCase = true) } }
+    val byName = compareBy<T> { name(it).lowercase() }
+    return when (sort) {
+        "lowest" -> matches.sortedWith(compareBy<T> { amount(it) }.then(byName))
+        "name" -> matches.sortedWith(byName)
+        else -> matches.sortedWith(compareByDescending<T> { amount(it) }.then(byName))
+    }
 }
