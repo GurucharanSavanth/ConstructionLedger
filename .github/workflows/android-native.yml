@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -35,14 +35,14 @@ jobs:
       - name: Install compile platform
         run: sdkmanager "platforms;android-37.0" "build-tools;36.0.0"
       - name: Build and verify
-        run: bash gradlew help :app:assembleDebug :app:assembleRelease :app:bundleRelease :app:testDebugUnitTest :app:lintDebug :app:lintRelease --no-daemon --console=plain
+        run: bash gradlew help :app:assembleDebug :app:assembleRelease :app:bundleRelease :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:compileDebugAndroidTestKotlin -PverificationApplication=true --no-daemon --console=plain
       - name: Verify device receipt checks
-        run: python3 -m unittest discover -s android-native/scripts -p 'test_device_receipts_test.py' -v
+        run: python3 -m unittest discover -s android-native/scripts -p 'test_*receipts_test.py' -v
       - name: Test legacy conversion
         run: node --test android-native/scripts/convert-legacy.test.mjs android-native/scripts/convert-legacy-units.test.mjs
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: buildledger-debug
+          name: buildledger-verification-debug
           path: android-native/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
@@ -51,26 +51,19 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Migration, backup and navigation gate
+      - name: Full Android and lifecycle gate
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 36
           target: google_apis
           arch: x86_64
+          emulator-options: -no-window -no-snapshot -gpu swiftshader -noaudio -no-boot-anim -camera-back none
           disable-animations: false
           script: |
             set -e
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.OfflineManifestTest
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.data.local.LedgerMigrationTest
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.data.backup.BackupServiceTest
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.EmptyLedgerBackupTest
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.ui.ZeroProjectNavigationTest
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.data.repository.ProjectDeletionTest
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.data.export.ProjectWorkbookExportTest
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.ActivityRecreationTest
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.DocumentNavigationTest
-            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --class com.constructioncost.nativeapp.LedgerOperationsTest
+            python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable
             python3 android-native/scripts/test-device.py --serial emulator-5554 --disposable --mode verification --class com.constructioncost.nativeapp.LedgerRestoreRecreationTest
+            python3 android-native/scripts/test-process.py --serial emulator-5554 --disposable
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -79,6 +72,8 @@ jobs:
           retention-days: 14
           path: |
             android-native/app/build/reports/tests/
+            android-native/app/build/reports/androidTests/
+            android-native/app/build/outputs/androidTest-results/
             android-native/app/build/reports/lint-results-*
             android-native/app/build/outputs/mapping/release/
             .tools/device-runs/

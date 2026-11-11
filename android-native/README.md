@@ -66,3 +66,17 @@ Release builds enable shrinking. Configure `BUILDLEDGER_KEYSTORE_PATH`, `BUILDLE
 Release builds automatically advance `release-version.txt` and embed `f.001`, `f.002`, etc., with increasing Android version codes. Signed builds use the same numbering. Preserve and commit the advanced counter before building releases elsewhere; see [release numbering and update requirements](UPDATES.md).
 
 Without production credentials the release APK is unsigned and cannot be installed as a public update. The `-PverificationApplication=true` package uses a separate application ID and test signing; it is for QA only. Retain the mapping file with each released APK. Never commit keys, passwords, private databases, backups or generated APKs.
+
+
+## Continuous integration
+
+`.github/workflows/android-native.yml` runs JVM tests, debug/release optimization checks, lint, Android-test compilation, receipt-runner tests and legacy converter tests. All CI Gradle builds use `-PverificationApplication=true`; release checks cannot reserve production version numbers. Uploaded debug APKs are verification builds and must not be distributed.
+
+An API-36 emulator uses software graphics and runs the full ordinary suite, the guarded restore/recreation class, then both genuine process-restart campaigns sequentially. Run the same process gate locally on a disposable emulator:
+
+```text
+python android-native/scripts/test-process.py --serial emulator-5554 --disposable
+python -m unittest discover -s android-native/scripts -p "test_*receipts_test.py" -v
+```
+
+The process runner builds and installs only metadata-verified verification APKs, records source/APK hashes and device identity, and rejects failed, skipped or missing test results. It never clears or uninstalls application data; an existing unverified workflow campaign is preserved and rejected. Different-PID assertions prove the restart. Receipts are under `.tools/device-runs/` and uploaded with test/lint reports even after CI failures. New pushes cancel obsolete runs on the same ref. Hosted execution status must be checked independently of local results.
