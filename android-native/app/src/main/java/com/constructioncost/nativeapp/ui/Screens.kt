@@ -367,8 +367,8 @@ internal fun ProjectsScreen(vm: LedgerViewModel, actions: UiActions) {
                     Text("Type Yes to confirm deletion")
                     Field("Confirmation", deleteConfirmation, { deleteConfirmation = it })
                     Button({ actions.exportProject(project.projectId); deleteCandidate = null }, Modifier.fillMaxWidth()) { Text("Export Project as Excel") }
-                    Button({ actions.deleteProject(project.projectId); deleteCandidate = null }, Modifier.fillMaxWidth(), enabled = deleteConfirmation == "Yes" && !state.saving) { Text("Delete Permanently") }
-                    TextButton({ deleteCandidate = null }, Modifier.fillMaxWidth()) { Text("No") }
+                    Button({ actions.deleteProject(project.projectId); deleteCandidate = null }, Modifier.fillMaxWidth(), enabled = deleteConfirmation.trim() == "Yes" && !state.saving) { Text("Delete Permanently") }
+                    TextButton({ deleteCandidate = null }, Modifier.fillMaxWidth()) { Text("Cancel") }
                 }
             }
         }
@@ -507,11 +507,13 @@ internal fun SettingsScreen(vm: LedgerViewModel, actions: UiActions, projectsAct
     val projects = remember(vm.repository) { vm.repository.projects }.readLedger(vm) ?: return StartupScreen("Loading saved records")
     val selected = projects.firstOrNull { it.id == project }
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item { PageHeading("Settings", "Manage your project and app preferences.") }
         if (selected != null) item(key = "project-settings") {
             var name by rememberSaveable(selected.id) { mutableStateOf(selected.name) }
             var budget by rememberSaveable(selected.id) { mutableStateOf(selected.budgetPaise?.let(Money::input).orEmpty()) }
             var expectedRevision by rememberSaveable(selected.id) { mutableLongStateOf(selected.revision) }
-            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            WebCard {
+                Text("Project details", style = MaterialTheme.typography.titleMedium)
                 Field("Project name", name, { name = it })
                 Field("Project budget (₹)", budget, { budget = it }, numeric = true)
                 WebCard(color=WebColors.soft) { Text("Changes to the budget affect planning only. Financial transactions are unchanged.",color=WebColors.muted) }
@@ -525,8 +527,12 @@ internal fun SettingsScreen(vm: LedgerViewModel, actions: UiActions, projectsAct
                 } }, enabled = !state.saving) { Text("Save project settings") }
             }
         }
-        item { AppUpdates(manual = true) }
-        item { Section("Android settings") {
+        item { WebCard {
+            Text("About BuildLedger", style = MaterialTheme.typography.titleMedium)
+            AppUpdates(manual = true)
+        } }
+        item { WebCard {
+            Text("Preferences", style = MaterialTheme.typography.titleMedium)
             actions.manageRecoveryCopies?.let { TextButton(it) { Text("Manage retained originals") } }
             Toggle("Local schedule reminders", state.reminders, actions.setReminders)
             Toggle("Show archived categories", state.showArchived, { vm.settings(showArchived = it) })

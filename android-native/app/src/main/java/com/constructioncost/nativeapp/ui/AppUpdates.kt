@@ -9,9 +9,16 @@ import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import androidx.compose.material3.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.listSaver
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -41,20 +48,22 @@ private fun connection(address: String): HttpURLConnection {
     }
 }
 
-private fun download(address: String, maximum: Long, sink: (ByteArray, Int) -> Unit) {
+private suspend fun download(address: String, maximum: Long, sink: (ByteArray, Int) -> Unit) {
     var location = address
     repeat(6) {
+        currentCoroutineContext().ensureActive()
         val request = connection(location)
         try {
             val status = request.responseCode
             if (status in listOf(301, 302, 303, 307, 308)) {
                 location = URL(URL(location), request.getHeaderField("Location") ?: error("Missing update redirect")).toString()
             } else {
-                check(status == 200) { "Update server returned HTTP $status" }
+                if (status != 200) throw UpdateHttpException(status)
                 var total = 0L
                 request.inputStream.use { input ->
                     val buffer = ByteArray(64 * 1024)
                     while (true) {
+                        currentCoroutineContext().ensureActive()
                         val count = input.read(buffer)
                         if (count < 0) break
                         total += count
@@ -110,10 +119,12 @@ internal suspend fun verifiedUpdateDownload(context: Context, release: AppReleas
     check(release.size in 1..MAX_APK && Regex("[a-fA-F0-9]{64}").matches(release.digest)) { "Invalid update metadata" }
     val directory = File(context.cacheDir, "updates").apply { mkdirs() }
     val file = File(directory, "${release.digest.lowercase()}.apk")
+    val job = currentCoroutineContext()[Job]
     fun digest(): String = file.inputStream().use { input ->
         val hash = MessageDigest.getInstance("SHA-256")
         val buffer = ByteArray(64 * 1024)
         while (true) {
+            job?.ensureActive()
             val count = input.read(buffer)
             if (count < 0) break
             hash.update(buffer, 0, count)
@@ -133,27 +144,53 @@ internal suspend fun verifiedUpdateDownload(context: Context, release: AppReleas
 } }
 
 @Composable
-internal fun AppUpdates(manual: Boolean = false) {
+internal fun AppUpdates(manual: Boolean = false, checkLatest: suspend (Context) -> AppRelease? = ::latest) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var checked by rememberSaveable { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
-    var release by remember { mutableStateOf<AppRelease?>(null) }
-    var message by remember { mutableStateOf<String?>(null) }
+    var release by rememberSaveable(stateSaver = listSaver<AppRelease?, String>(
+        save = { it?.let { value -> listOf(value.tag, value.url, value.size.toString(), value.digest, value.versionName) } ?: emptyList() },
+        restore = { if (it.isEmpty()) null else AppRelease(it[0], it[1], it[2].toLong(), it[3], it[4]) }
+    )) { mutableStateOf<AppRelease?>(null) }
+    var checkJob by remember { mutableStateOf<Job?>(null) }
+    var retryCheck by rememberSaveable { mutableStateOf(false) }
+    var message by rememberSaveable { mutableStateOf<String?>(null) }
     fun check(showResult: Boolean) {
         if (busy) return
         busy = true
-        scope.launch {
+        retryCheck = false
+        message = null
+        checkJob = scope.launch {
             try {
-                release = latest(context)
+                release = checkLatest(context)
                 if (showResult && release == null) message = "BuildLedger is up to date."
             } catch (cancelled: CancellationException) { throw cancelled }
-            catch (error: Exception) { if (showResult) message = "Could not check updates: ${error.message}. Try again later." }
+            catch (error: Exception) { if (showResult) { retryCheck = true; message = updateFailureMessage(error) } }
             finally { busy = false }
         }
     }
     LaunchedEffect(Unit) { if (!manual && !checked) { checked = true; check(false) } }
-    if (manual) TextButton({ check(true) }, enabled = !busy) { Text(if (busy) "Checking updates…" else "Check for updates") }
+    if (manual) OutlinedButton({ check(true) }, Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = !busy) { WebIcon("download"); Spacer(Modifier.width(12.dp)); Text(if (busy) "Checking updates…" else "Check for updates") }
+    if (manual) {
+        Text("Installed version: ${context.packageManager.getPackageInfo(context.packageName, 0).versionName}", style = MaterialTheme.typography.bodyMedium)
+        if (busy) {
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+            if (checkJob?.isActive == true) TextButton({ checkJob?.cancel() }) { Text("Cancel check") }
+        }
+        Text("Checks download and verify the latest APK before installation.", style = MaterialTheme.typography.bodySmall)
+        OutlinedButton({
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, "Get BuildLedger: https://github.com/GurucharanSavanth/ConstructionLedger/releases/latest")
+            }
+            context.startActivity(Intent.createChooser(send, "Share BuildLedger"))
+        }, Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+            WebIcon("share")
+            Spacer(Modifier.width(12.dp))
+            Text("Share app")
+        }
+    }
     release?.let { update -> AlertDialog(
         onDismissRequest = { if (!busy) release = null },
         title = { Text("BuildLedger ${update.versionName} available") },
@@ -181,5 +218,7 @@ internal fun AppUpdates(manual: Boolean = false) {
         dismissButton = { TextButton({ release = null }, enabled = !busy) { Text("Later") } }
     ) }
     message?.let { text -> AlertDialog(onDismissRequest = { message = null }, title = { Text("App updates") },
-        text = { Text(text) }, confirmButton = { TextButton({ message = null }) { Text("OK") } }) }
+        text = { Text(text) }, confirmButton = {
+            TextButton({ message = null; if (retryCheck) check(true) }) { Text(if (retryCheck) "Retry" else "OK") }
+        }, dismissButton = { if (retryCheck) TextButton({ message = null }) { Text("Cancel") } }) }
 }

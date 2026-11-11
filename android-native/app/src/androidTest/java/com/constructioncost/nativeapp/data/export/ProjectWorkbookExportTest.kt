@@ -160,7 +160,7 @@ class ProjectWorkbookExportTest {
                 assertFalse(records.contains("\uFFFE") || records.contains("\uFFFF"))
                 assertTrue(table.contains("<autoFilter ref=\"A1:P16\""))
                 assertTrue(records.contains("attachments/attachment-000001.bin"))
-                assertTrue(links.contains("Target=\"../../attachments/attachment-000001.bin\""))
+                assertTrue(links.contains("Target=\"attachments/attachment-000001.bin\""))
                 assertTrue(zip.getEntry("xl/charts/chart1.xml") != null)
                 assertTrue(zip.getEntry("xl/drawings/_rels/drawing1.xml.rels") != null)
             }
@@ -207,6 +207,36 @@ class ProjectWorkbookExportTest {
                 val records = workbook.getInputStream(workbook.getEntry("xl/worksheets/sheet2.xml")).bufferedReader().use { it.readText() }
                 assertTrue(records.contains("North invoice"))
                 assertFalse(records.contains("Private south invoice"))
+                var externalLinks = 0
+                workbook.entries().asSequence().filter { it.name.endsWith(".rels") }.forEach { entry ->
+                    val parser = Xml.newPullParser().apply {
+                        setInput(StringReader(workbook.getInputStream(entry).bufferedReader().use { it.readText() }))
+                    }
+                    while (parser.next() != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
+                        if (parser.eventType == org.xmlpull.v1.XmlPullParser.START_TAG && parser.name == "Relationship" &&
+                            parser.getAttributeValue(null, "TargetMode") == "External") {
+                            val target = parser.getAttributeValue(null, "Target")
+                            val root = File(context.cacheDir, "extracted-package").canonicalFile
+                            val resolved = File(root, target).canonicalFile
+                            assertTrue(resolved.path.startsWith(root.path + File.separator))
+                            root.mkdirs()
+                            try { ZipFile(packageFile).use { archive ->
+                                archive.entries().asSequence().filter { !it.isDirectory }.forEach { packaged ->
+                                    val output = File(root, packaged.name).canonicalFile
+                                    assertTrue(output.path.startsWith(root.path + File.separator))
+                                    output.parentFile!!.mkdirs()
+                                    archive.getInputStream(packaged).use { input -> output.outputStream().use { input.copyTo(it) } }
+                                }
+                                val bytes = resolved.readBytes()
+                                assertTrue(original.contentEquals(bytes))
+                                assertEquals(DocumentPolicy.sha256(source), MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) })
+                            }
+                            } finally { root.deleteRecursively() }
+                            externalLinks++
+                        }
+                    }
+                }
+                assertTrue(externalLinks > 0)
             }
         } finally {
             source.delete(); packageFile.delete(); workbookFile?.delete(); generated?.delete(); repository.close()

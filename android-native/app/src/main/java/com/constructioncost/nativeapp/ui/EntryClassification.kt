@@ -90,10 +90,16 @@ internal fun ClassificationChoice(
             else {
                 attempted = true
                 val info = ClassificationInfo(newId(), projectId, normalized, createKind, createParentId, (maximum ?: -1) + 1)
-                vm.command("Category created") {
+                val sourceDraft = state.draft
+                vm.command("Category created", onSuccess = {
+                    val current = vm.state.value
+                    if (current.projectId == projectId && current.draft.id == sourceDraft.id &&
+                        current.draft.get("key") == sourceDraft.get("key")) {
+                        if (onCreated == null) choose(info.id) else onCreated(info)
+                        creating = false
+                    }
+                }) {
                     vm.repository.saveClassification(info)
-                    if (onCreated == null) choose(info.id) else onCreated(info)
-                    creating = false
                 }
             }
         }, enabled = !state.saving) { Text("Create and select") } },

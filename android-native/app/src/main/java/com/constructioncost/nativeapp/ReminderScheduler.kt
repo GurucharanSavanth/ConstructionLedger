@@ -39,7 +39,10 @@ object ReminderScheduler {
     private const val JOB_ID = 451021
     internal const val PROJECT_EXTRA = "reminderProjectId"
     private val notificationMutex = Mutex()
+    private var lastSubmissionMillis = 0L
     private const val CHANNEL = "local_instalments"
+    internal const val OVERFLOW_TAG = "instalment-overflow"
+    internal const val INDIVIDUAL_LIMIT = 20
 
     internal fun permissionGranted(context: Context) = Build.VERSION.SDK_INT < 33 ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
@@ -108,10 +111,13 @@ object ReminderScheduler {
         if (!permissionGranted(context)) return
         val manager = context.getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "Instalment reminders", NotificationManager.IMPORTANCE_DEFAULT))
-        val active = manager.activeNotifications.filter { it.notification.channelId == CHANNEL }
+        // Android owns automatic group summaries; cancelling one can also remove its children.
+        val active = manager.activeNotifications.filter {
+            it.notification.channelId == CHANNEL &&
+                (it.notification.flags and android.app.Notification.FLAG_GROUP_SUMMARY == 0 || it.tag == OVERFLOW_TAG)
+        }
         val postedIds = active.mapNotNull { it.tag }.toSet()
         if (postedOnly && postedIds.isEmpty()) return
-        val liveIds = mutableSetOf<String>()
         val today = LocalDate.now()
         val deliveryKey = stringPreferencesKey("reminder_deliveries")
         val saved = JSONObject(context.ledgerPreferences.data.first()[deliveryKey] ?: "{}")
@@ -119,41 +125,60 @@ object ReminderScheduler {
         suspend fun persistDeliveries() { context.ledgerPreferences.edit {
             it[deliveryKey] = JSONObject().put("date", today.toString()).put("entries", delivered).toString()
         } }
+        data class Reminder(val id: String, val projectId: String, val text: String, val contentKey: String = text)
+        val eligible = mutableListOf<Reminder>()
         for (project in repo.projects.first().filter { !it.archived }) {
             for (schedule in repo.instalments(project.id).first()) {
-                liveIds.add(schedule.id)
-                if (!com.constructioncost.nativeapp.domain.reminderEligible(schedule, today)) {
-                    manager.cancel(schedule.id, 0)
-                    continue
-                }
-                if (postedOnly && schedule.id !in postedIds) continue
+                if (!com.constructioncost.nativeapp.domain.reminderEligible(schedule, today)) continue
                 val due = LocalDate.parse(schedule.dueDate)
-                val text = "${project.name} — ${schedule.title}: ${Money.format(schedule.outstandingPaise)} ${if (due.isBefore(today)) "overdue" else "due ${schedule.dueDate}"}"
-                val fingerprint = "${project.id}\n$text"
-                if (active.firstOrNull { it.tag == schedule.id }?.notification?.extras?.getCharSequence(android.app.Notification.EXTRA_TEXT) == text) {
-                    // An active notification also repairs history interrupted between notify and persistence.
-                    if (delivered.optString(schedule.id) != fingerprint) {
-                        delivered.put(schedule.id, fingerprint)
-                        persistDeliveries()
-                    }
-                    continue
-                }
-                if (!postedOnly && delivered.optString(schedule.id) == fingerprint) continue
-                val intent = PendingIntent.getActivity(context, 0, Intent(context, MainActivity::class.java)
-                    .setData("buildledger://reminder/${Uri.encode(project.id)}/${Uri.encode(schedule.id)}".toUri())
-                    .putExtra(PROJECT_EXTRA, project.id).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-                manager.notify(schedule.id, 0, NotificationCompat.Builder(context, CHANNEL)
-                    .setSmallIcon(android.R.drawable.ic_dialog_info)
-                    .setContentTitle("Construction payment reminder")
-                    .setContentText(text).setStyle(NotificationCompat.BigTextStyle().bigText(text))
-                    .setContentIntent(intent).setOnlyAlertOnce(true).setAutoCancel(true).build())
-                delivered.put(schedule.id, fingerprint)
-                persistDeliveries()
+                val text = "${project.name} ? ${schedule.title}: ${Money.format(schedule.outstandingPaise)} ${if (due.isBefore(today)) "overdue" else "due ${schedule.dueDate}"}"
+                eligible.add(Reminder(schedule.id, project.id, text))
             }
         }
-        manager.activeNotifications.filter { it.notification.channelId == CHANNEL && it.tag !in liveIds }
-            .forEach { manager.cancel(it.tag, it.id) }
+        val ordered = eligible.sortedBy { it.id }
+        val notifications = ordered.take(INDIVIDUAL_LIMIT).toMutableList()
+        val overflow = ordered.drop(INDIVIDUAL_LIMIT)
+        if (overflow.isNotEmpty()) {
+            val projectCount = overflow.map { it.projectId }.distinct().size
+            val text = "${overflow.size} more payment reminders across $projectCount project(s). " +
+                "Open the app and review Calendar for each project.\n" + overflow.take(10).joinToString("\n") { it.text } +
+                if (overflow.size > 10) "\nAnd ${overflow.size - 10} more schedules." else ""
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            overflow.forEach { digest.update("${it.id}\n${it.projectId}\n${it.text}\n".toByteArray(Charsets.UTF_8)) }
+            val contentKey = digest.digest().joinToString("") { "%02x".format(it) }
+            notifications.add(Reminder(OVERFLOW_TAG, overflow.first().projectId, text, contentKey))
+        }
+        val liveIds = notifications.map { it.id }.toSet()
+        // Cancel old individual notifications before posting the bounded replacement set.
+        active.filter { it.tag !in liveIds }.forEach { manager.cancel(it.tag, it.id) }
+        for (reminder in notifications) {
+            // An active digest already covers promoted members; keep that coverage when a slot opens.
+            if (postedOnly && reminder.id !in postedIds && OVERFLOW_TAG !in postedIds) continue
+            val fingerprint = "${reminder.projectId}\n${reminder.contentKey}"
+            if (active.firstOrNull { it.tag == reminder.id }?.notification?.extras?.getCharSequence(android.app.Notification.EXTRA_TEXT) == reminder.text &&
+                (reminder.id != OVERFLOW_TAG || delivered.optString(reminder.id) == fingerprint)) {
+                // Repair history interrupted between notification submission and persistence.
+                delivered.put(reminder.id, fingerprint)
+                continue
+            }
+            if (!postedOnly && delivered.optString(reminder.id) == fingerprint) continue
+            val intent = PendingIntent.getActivity(context, 0, Intent(context, MainActivity::class.java)
+                .setData("buildledger://reminder/${Uri.encode(reminder.projectId)}/${Uri.encode(reminder.id)}".toUri())
+                .putExtra(PROJECT_EXTRA, reminder.projectId).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            // Stay below Android's per-package update rate, including the initial individual burst.
+            val waitMillis = lastSubmissionMillis + 300L - android.os.SystemClock.elapsedRealtime()
+            if (waitMillis > 0) kotlinx.coroutines.delay(waitMillis)
+            manager.notify(reminder.id, 0, NotificationCompat.Builder(context, CHANNEL)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle(if (reminder.id == OVERFLOW_TAG) "More construction payment reminders" else "Construction payment reminder")
+                .setContentText(reminder.text).setStyle(NotificationCompat.BigTextStyle().bigText(reminder.text))
+                .setContentIntent(intent).setOnlyAlertOnce(true).setAutoCancel(true).build())
+            lastSubmissionMillis = android.os.SystemClock.elapsedRealtime()
+            // This is submission history for duplicate suppression, not a delivery acknowledgement.
+            delivered.put(reminder.id, fingerprint)
+            persistDeliveries()
+        }
         delivered.keys().asSequence().toList().filter { it !in liveIds }.forEach(delivered::remove)
         persistDeliveries()
     }

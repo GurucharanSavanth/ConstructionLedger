@@ -24,6 +24,7 @@ import org.junit.runner.RunWith
 class DocumentNavigationTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
     private val repository get() = (context.applicationContext as ConstructionApplication).repository
+    private val operations get() = (context.applicationContext as ConstructionApplication).operations
     private val projectKey = stringPreferencesKey("project")
     private var previousProject: String? = null
     private lateinit var attachment: AttachmentInfo
@@ -57,12 +58,18 @@ class DocumentNavigationTest {
         compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Saved documents"))
     }
 
+    private fun awaitFileOperation(timeoutMillis: Long = 10_000) {
+        // Check the operation state before asking Espresso to idle an indeterminate progress dialog.
+        compose.waitUntil(timeoutMillis) { !operations.state.value.busy }
+    }
+
     @Test fun keptPhotoCanBeKeptThenImportedAfterRecreation() = runBlocking<Unit> {
         val captures = CameraCaptures(context)
         val photo = captures.create("photo-${java.util.UUID.randomUUID()}.jpg")
         val image = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888)
         photo.outputStream().use { image.compress(Bitmap.CompressFormat.JPEG, 95, it) }
         image.recycle()
+        val originalBytes = photo.readBytes()
         val originalHash = DocumentPolicy.sha256(photo)
         val number = captures.list().indexOfFirst { it.name == photo.name } + 1
         var imported: AttachmentInfo? = null
@@ -71,31 +78,48 @@ class DocumentNavigationTest {
             compose.onNodeWithText("Files").performClick()
             compose.waitUntil(10_000) { compose.onAllNodesWithText("Kept camera photos").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Kept camera photos").performClick()
+            awaitFileOperation()
             compose.waitUntil(10_000) { compose.onAllNodesWithText("Discard photo $number").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Discard photo $number").performScrollTo().performClick()
             compose.onNodeWithText("Cancel").performClick()
             org.junit.Assert.assertTrue(photo.isFile)
             org.junit.Assert.assertEquals(originalHash, DocumentPolicy.sha256(photo))
             compose.onNodeWithText("Kept camera photos").performClick()
+            awaitFileOperation()
+            org.junit.Assert.assertTrue(operations.state.value.capturedPhotos.orEmpty().any { it.name == photo.name })
             compose.waitUntil(10_000) { compose.onAllNodesWithText("Import photo $number into selected project").fetchSemanticsNodes().isNotEmpty() }
             compose.activityRule.scenario.recreate()
             compose.waitUntil(10_000) { compose.onAllNodesWithText("Import photo $number into selected project").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Import photo $number into selected project").performScrollTo().performClick()
+            awaitFileOperation(30_000)
             compose.waitUntil(30_000) { !photo.exists() }
             val saved = repository.attachments("default-project").first().single { it.name == photo.name }
             imported = saved
             org.junit.Assert.assertEquals(originalHash, saved.sha256)
+            org.junit.Assert.assertEquals(originalBytes.size.toLong(), saved.size)
+            org.junit.Assert.assertArrayEquals(originalBytes, store.fileFor(saved).readBytes())
+            org.junit.Assert.assertEquals(1, repository.attachments("default-project").first().count { it.name == photo.name })
             compose.onAllNodesWithText("Keep for later").fetchSemanticsNodes().takeIf { it.isNotEmpty() }?.let {
                 compose.onNodeWithText("Keep for later").performClick()
             }
+            showSavedDocuments()
+            compose.waitUntil(10_000) { compose.onAllNodesWithText(photo.name, substring = false).fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("Home", substring = false).performClick()
+            compose.waitUntil(10_000) { compose.onAllNodesWithText("Project overview").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("Files", substring = false).performClick()
             showSavedDocuments()
             compose.waitUntil(10_000) { compose.onAllNodesWithText(photo.name, substring = false).fetchSemanticsNodes().isNotEmpty() }
             compose.activityRule.scenario.recreate()
             showSavedDocuments()
             compose.waitUntil(10_000) { compose.onAllNodesWithText(photo.name, substring = false).fetchSemanticsNodes().isNotEmpty() }
             org.junit.Assert.assertEquals(originalHash, DocumentPolicy.sha256(store.fileFor(saved)))
+            org.junit.Assert.assertEquals(saved, repository.attachments("default-project").first().single { it.id == saved.id })
+            org.junit.Assert.assertArrayEquals(originalBytes, store.fileFor(saved).readBytes())
+            org.junit.Assert.assertEquals(1, repository.attachments("default-project").first().count { it.name == photo.name })
         } finally {
-            imported?.let { repository.deleteAttachmentMetadata(it.id); store.fileFor(it).delete() }
+            awaitFileOperation()
+            val saved = imported ?: repository.attachments("default-project").first().singleOrNull { it.name == photo.name }
+            saved?.let { repository.deleteAttachmentMetadata(it.id); store.fileFor(it).delete() }
             if (photo.exists()) captures.discard(photo)
         }
     }

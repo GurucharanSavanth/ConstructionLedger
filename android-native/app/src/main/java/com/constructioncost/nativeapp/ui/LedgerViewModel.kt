@@ -385,7 +385,7 @@ class LedgerViewModel(
         }
     }
 
-    fun command(success: String, action: suspend () -> Unit) {
+    fun command(success: String, onSuccess: () -> Unit = {}, action: suspend () -> Unit) {
         if (mutable.value.saving) return
         mutable.value = mutable.value.copy(saving = true, actionError = null, message = null)
         viewModelScope.launch {
@@ -393,6 +393,7 @@ class LedgerViewModel(
                 action()
                 ReminderScheduler.refreshPosted(context, repository)
                 mutable.value = mutable.value.copy(saving = false, message = success)
+                onSuccess()
             } catch (error: CancellationException) { throw error
             } catch (error: Exception) {
                 if (error is android.database.sqlite.SQLiteException) storageFailure(error)
@@ -521,7 +522,8 @@ class LedgerViewModel(
                 "Plan" -> repository.saveInstalment(instalment(draft))
                 "Contract" -> repository.saveCommitment(commitment(draft))
                 "Work log" -> repository.saveNote(ActivityNote(draft.id, draft.projectId,
-                    draft.get("description").trim(), draft.date, draft.get("note"), draft.get("revision").toLongOrNull() ?: 0))
+                    draft.get("description").trim(), draft.date, draft.get("note"), draft.get("revision").toLongOrNull() ?: 0),
+                    draft.get("revision").toLongOrNull())
                 "Allocate advance" -> error("Choose an advance and unpaid expense in Payments.")
                 else -> repository.saveExpense(expense(draft))
             }

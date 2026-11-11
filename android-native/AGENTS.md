@@ -76,3 +76,10 @@ Production release variant tasks reserve `f.NNN` and numeric code `N + 1` throug
 `platform/files/CameraCaptures.kt` keeps camera bytes under persistent `filesDir/camera-captures` until import commits or the user confirms discard. Files exposes explicit review/retry. Nonempty legacy captures must survive cache cleanup; no automatic financial/file replay on startup. A kept source may already have a committed document after interrupted cleanup, so recovery UI must describe that uncertainty.
 
 Match existing Kotlin formatting and Compose components. No new framework or dependency for routine refactoring. Update the parent memory map when changing ownership, schema, commands or verification status.
+
+
+## Lifecycle verification follow-up
+
+- Current clean ordinary gate:269/269 cases, zero failures/errors/skips, recorded in `../.tools/device-runs/20261111-230646-ordinary-120ca75f/summary.json`. Lifecycle matrix and phase commands: `../output/android-lifecycle-2026-11-11.md`.
+- Windows emulator graphics stalls were observed across app, SystemUI and launcher. Existing AVD ran the clean gate with process-local `-no-snapshot-load -no-snapshot-save -gpu swiftshader -no-window`; do not wipe or replace its data to reproduce this setup. Preserve prior failed reports and avoid concurrent UI captures during instrumentation.
+- `WorkflowRestartTest` and `ReminderOverflowProcessTest` are guarded `SeparateVerification` two-phase tests requiring different PIDs. Ordinary Gradle teardown removes disposable packages; install only metadata-verified `.verification` app/test APKs for direct phases. Preserve receipts and synthetic campaign evidence before teardown. Reminder continuity uses `am kill`, since force-stop removes notifications. See the lifecycle report for exact commands and cleanup guards.

@@ -980,10 +980,11 @@ class LedgerRepository internal constructor(private val database: LedgerDatabase
         val leadDays = row("reminders", id)?.getInt("leadDays") ?: 3
         save("reminders", json("id" to id, "instalmentId" to id, "enabled" to false, "leadDays" to leadDays))
     }
-    suspend fun saveNote(note: ActivityNote) = write {
+    suspend fun saveNote(note: ActivityNote, expectedRevision: Long? = null) = write {
         id(note.id); project(note.projectId); text(note.title); date(note.date)
         val before = row("activity_entries", note.id); before?.let { require(it.getString("projectId") == note.projectId) }
-        save("activity_entries", json("id" to note.id, "projectId" to note.projectId, "title" to note.title, "date" to note.date, "note" to note.note, "revision" to revision(before, note.revision)))
+        require(if (expectedRevision == null) before == null else before != null) { "Note changed or missing; reload this record" }
+        save("activity_entries", json("id" to note.id, "projectId" to note.projectId, "title" to note.title, "date" to note.date, "note" to note.note, "revision" to revision(before, expectedRevision)))
     }
     suspend fun deleteNote(id: String, revision: Long) = write {
         val before = row("activity_entries", id) ?: error("Note missing"); revision(before, revision)

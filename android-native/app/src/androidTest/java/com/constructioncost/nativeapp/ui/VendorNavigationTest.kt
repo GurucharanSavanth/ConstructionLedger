@@ -44,14 +44,14 @@ class VendorNavigationTest {
     private fun openSettings() { compose.onNodeWithContentDescription("Project settings").performClick() }
     private fun openProjects() {
         if(compose.onAllNodesWithText("Project settings",substring=false).fetchSemanticsNodes().isEmpty()) openSettings()
-        compose.onNodeWithText("▸ Android settings").performScrollTo().performClick()
-        compose.onNodeWithText("Manage projects").performScrollTo().performClick()
+        compose.onNode(hasScrollToNodeAction() and hasAnyAncestor(isDialog())).performScrollToNode(hasText("Manage projects"))
+        compose.onNodeWithText("Manage projects").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithText("Projects", substring = false).fetchSemanticsNodes().isNotEmpty() }
     }
     private fun openSuppliers() {
         openSettings()
-        compose.onNodeWithText("▸ Android settings").performScrollTo().performClick()
-        compose.onNodeWithText("Manage suppliers").performScrollTo().performClick()
+        compose.onNode(hasScrollToNodeAction() and hasAnyAncestor(isDialog())).performScrollToNode(hasText("Manage suppliers"))
+        compose.onNodeWithText("Manage suppliers").performClick()
         compose.waitUntil(5_000) {
             compose.onAllNodesWithText("Vendors", substring = false).fetchSemanticsNodes().isNotEmpty() &&
                 compose.onAllNodes(hasScrollToNodeAction()).fetchSemanticsNodes().size == 1
@@ -100,7 +100,7 @@ class VendorNavigationTest {
         compose.onNodeWithText("Delete Permanently", substring = false).assertIsNotEnabled()
         compose.onAllNodes(hasSetTextAction(), useUnmergedTree = true).onLast().performTextReplacement("Yes")
         compose.onNodeWithText("Delete Permanently", substring = false).assertIsEnabled()
-        compose.onNodeWithText("No", substring = false).performClick()
+        compose.onNodeWithText("Cancel", substring = false).performClick()
         compose.onNodeWithText("Delete project permanently?", substring = false).assertDoesNotExist()
         compose.onNodeWithContentDescription("Select project. Current project: North house").assertExists()
 

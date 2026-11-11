@@ -325,7 +325,7 @@ internal fun WebExploreScreen(vm:LedgerViewModel,activity:(ExpenseFilter)->Unit,
             else if(rows == null) item { WebCard { Text("Loading this level…") } }
             else {
                 if(tab !in listOf("cost","hierarchy") && comparison.totalPaise>0) item { WebCard { Eyebrow("RECORDED BILL COSTS");InsightDonut(comparison) { row ->
-                    activity(when(dimension){"SUPPLIER"->ExpenseFilter(vendorId=row.id,missingVendor=row.id==null,postedOnly=true);"MATERIAL"->ExpenseFilter(materialName=row.name,postedOnly=true);else->ExpenseFilter(classificationId=row.id,postedOnly=true)})
+                    activity(when(dimension){"SUPPLIER"->ExpenseFilter(vendorId=row.id,missingVendor=row.id==null,postedOnly=true);"MATERIAL"->ExpenseFilter(materialName=row.name,postedOnly=true);else->if(row.id==null) ExpenseFilter(status=when(dimension){"WORK"->"UNCLASSIFIED_WORK";"PLACE"->"UNCLASSIFIED_PLACE";else->"UNCLASSIFIED"},postedOnly=true) else ExpenseFilter(classificationId=row.id,postedOnly=true)})
                 } } }
                 item { WebCard(modifier=Modifier.animateContentSize(animationSpec=tween(220))) {
                     Text(if(tab=="hierarchy") "Construction cost explorer" else if(tab=="cost") "Cost head explorer" else "Category ranking",style=MaterialTheme.typography.titleLarge)

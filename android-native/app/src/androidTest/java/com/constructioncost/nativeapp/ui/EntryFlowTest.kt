@@ -19,6 +19,7 @@ import com.constructioncost.nativeapp.domain.ExpenseFilter
 import com.constructioncost.nativeapp.platform.UiActions
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -93,8 +94,27 @@ class EntryFlowTest {
         compose.waitUntil(30_000) {
             runBlocking { repository.classifications("default-project").first().any { it.name == "Pool equipment" } }
         }
+        compose.waitUntil(30_000) {
+            compose.onAllNodesWithContentDescription("Cost head: Pool equipment").fetchSemanticsNodes().isNotEmpty()
+        }
+        val category = runBlocking { repository.classifications("default-project").first().single { it.name == "Pool equipment" } }
+        val storedDraft = runBlocking { withTimeout(10_000) {
+            preferences.preferences.store.data.first { values -> values.asMap().values.any { value ->
+                value is String && value.contains(category.id) && value.contains("COST")
+            } }.asMap().values.filterIsInstance<String>().first { it.contains(category.id) && it.contains("COST") }
+        } }
+        assertEquals(category.id, EntryDraft.read(storedDraft).get("COST"))
         compose.onNodeWithText("Find a category").performScrollTo().performTextInput("Pool equipment")
         compose.waitUntil(30_000) { compose.onAllNodesWithText("Pool equipment").fetchSemanticsNodes().isNotEmpty() }
         assertTrue(runBlocking { repository.classifications("default-project").first().any { it.name == "Pool equipment" } })
+        compose.onNodeWithText("Material / item").performScrollTo().performTextInput("Pump")
+        compose.onNodeWithText("Final amount (₹)").performScrollTo().performTextInput("50")
+        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Review and save"))
+        compose.onNodeWithText("Review and save").performClick()
+        compose.onNodeWithText("Save entry").performClick()
+        compose.waitUntil(30_000) { runBlocking { repository.expenses("default-project").first().size == 1 } }
+        val saved = runBlocking { repository.expense(repository.expenses("default-project").first().single().id)!! }
+        assertEquals(5_000L, saved.amountPaise)
+        assertEquals(category.id, saved.classifications.single { it.dimension == "COST" }.classificationId)
     }
 }

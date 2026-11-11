@@ -32,6 +32,39 @@ class NativeReplicaTest {
         compose.waitUntil(10_000){compose.onAllNodesWithText("Project overview").fetchSemanticsNodes().isNotEmpty()}
     }
 
+    @Test fun workChartUnclassifiedOpensOnlyUnclassifiedRecordedBills() = chartUnclassified("WORK", "Work stage")
+
+    @Test fun placeChartUnclassifiedOpensOnlyUnclassifiedRecordedBills() = chartUnclassified("PLACE", "Location")
+
+    private fun chartUnclassified(dimension: String, label: String) {
+        start()
+        runBlocking {
+            repository.saveProject(ProjectInfo("other-chart-project", "Other chart project"))
+            val category = repository.classifications("default-project").first().first { kindDimension(it.kind) == dimension }
+            repository.saveExpense(ExpenseInput(id="chart-classified",projectId="default-project",description="Classified chart bill",amountPaise=10_000,date="2026-10-01",
+                classifications=listOf(ClassificationPart(category.id,dimension,10_000))))
+            repository.saveExpense(ExpenseInput(id="chart-unclassified",projectId="default-project",description="Unclassified chart bill",amountPaise=5_000,date="2026-10-01"))
+            repository.saveExpense(ExpenseInput(id="chart-other",projectId="other-chart-project",description="Other project chart bill",amountPaise=7_000,date="2026-10-01"))
+            repository.savePayment(PaymentInput(id="chart-payment",projectId="default-project",amountPaise=3_000,date="2026-10-01",reference="Chart cash only"))
+            repository.saveInstalment(InstalmentInput(id="chart-plan",projectId="default-project",title="Chart future plan",amountPaise=9_000,dueDate="2026-12-01"))
+        }
+        compose.onNodeWithText("Explore").performClick()
+        compose.onNodeWithContentDescription("Explore by: Cost Heads").performClick()
+        compose.onNodeWithText(label, substring=false).performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Unclassified", substring=false).fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodesWithText("Unclassified", substring=false)[0].performScrollTo().performClick()
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Unclassified chart bill", substring=false).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Classified chart bill", substring=false).assertDoesNotExist()
+        compose.onNodeWithText("Other project chart bill", substring=false).assertDoesNotExist()
+        compose.onNodeWithText("Chart cash only", substring=false).assertDoesNotExist()
+        compose.onNodeWithText("Chart future plan", substring=false).assertDoesNotExist()
+        compose.onAllNodesWithText(Money.format(5_000L))[0].assertExists()
+        compose.onNodeWithText("Bill cost ${Money.format(5_000L)}").assertExists()
+        val rows = runBlocking { repository.expenses("default-project", ExpenseFilter(status=if(dimension=="WORK") "UNCLASSIFIED_WORK" else "UNCLASSIFIED_PLACE",postedOnly=true)).first() }
+        assertEquals(listOf("chart-unclassified"), rows.map { it.id })
+        assertEquals(5_000L, rows.sumOf { it.amountPaise })
+    }
+
     @Test fun fiveWebTabsAndNineNativeEntryChoicesAreReachable() {
         start()
         screenshot("home")
@@ -201,7 +234,7 @@ class NativeReplicaTest {
         awaitCount(75)
         more(); awaitCount(150)
         more(); awaitCount(151)
-        runBlocking { repository.saveNote(ActivityNote("note-60", "default-project", "Edited cached work", "2026-10-23", "", revision = 0)) }
+        runBlocking { repository.saveNote(ActivityNote("note-60", "default-project", "Edited cached work", "2026-10-23", "", revision = 0), expectedRevision = 0) }
         compose.onNode(hasScrollToNodeAction()).performScrollToIndex(0)
         awaitCount(75)
         more(); awaitCount(150)

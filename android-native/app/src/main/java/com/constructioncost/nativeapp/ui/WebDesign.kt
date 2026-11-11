@@ -63,6 +63,9 @@ internal fun WebIcon(name: String, modifier: Modifier = Modifier, tint: Color = 
             drawPath(p,tint,style=Stroke(1.7f*s,cap=StrokeCap.Round))
         }
         when(name) {
+            "download" -> { line(12f,3f,12f,16f); path(7f to 11f,12f to 16f,17f to 11f); path(4f to 17f,4f to 21f,20f to 21f,20f to 17f) }
+            "share" -> { line(7f,11f,17f,6f); line(7f,13f,17f,18f); for (point in listOf(5f to 12f,19f to 5f,19f to 19f)) drawCircle(tint,3*s,Offset(point.first*s,point.second*s),style=Stroke(1.7f*s)) }
+
             "home" -> { path(3f to 11f,12f to 3f,21f to 11f); path(5f to 10f,5f to 21f,19f to 21f,19f to 10f); path(9f to 21f,9f to 14f,15f to 14f,15f to 21f) }
             "entry", "add" -> { path(4f to 4f,20f to 4f,20f to 20f,4f to 20f,close=true); line(12f,8f,12f,16f); line(8f,12f,16f,12f) }
             "activity", "time" -> { drawCircle(tint,9*s,Offset(12*s,12*s),style=Stroke(1.7f*s)); line(12f,6f,12f,12f);line(12f,12f,17f,14f) }

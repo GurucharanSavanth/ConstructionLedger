@@ -359,7 +359,7 @@ internal object ProjectWorkbookWriter {
             zip.putNextEntry(ZipEntry("xl/worksheets/_rels/sheet2.xml.rels"))
             val rels = buildString {
                 append("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/table\" Target=\"../tables/table1.xml\"/>")
-                links.forEachIndexed { index, (_, path) -> append("<Relationship Id=\"rId${index + 2}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"../../${xml(path)}\" TargetMode=\"External\"/>") }
+                links.forEachIndexed { index, (_, path) -> append("<Relationship Id=\"rId${index + 2}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"${xml(path)}\" TargetMode=\"External\"/>") }
                 append("</Relationships>")
             }
             zip.write(rels.toByteArray(Charsets.UTF_8)); zip.closeEntry()

@@ -23,7 +23,7 @@ class LedgerMigrationTest {
 
     @Test fun everyMigrationEdgePreservesFinancialRelationshipsAndValidatesExportedSchema() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
-        for ((start, end) in listOf(1 to 2, 2 to 3, 3 to 4, 1 to 4, 4 to 5, 1 to 5, 5 to 6, 1 to 6)) {
+        for ((start, end) in (1..5).flatMap { start -> (start + 1..6).map { end -> start to end } }) {
             val name = "ledger-edge-$start-$end-${System.nanoTime()}.db"
             try {
                 helper.createDatabase(name, start).use { db ->
@@ -74,6 +74,9 @@ class LedgerMigrationTest {
                     }
                     if (end == 6) db.query("SELECT COUNT(*) FROM project_deletions").use { cursor -> assertTrue(cursor.moveToFirst()); assertEquals(0, cursor.getInt(0)) }
                     db.query("PRAGMA foreign_key_check").use { assertTrue(!it.moveToFirst()) }
+                    db.query("PRAGMA integrity_check").use { cursor ->
+                        assertTrue(cursor.moveToFirst()); assertEquals("ok", cursor.getString(0)); assertTrue(!cursor.moveToNext())
+                    }
                 }
                 val migrated = Room.databaseBuilder(context, LedgerDatabase::class.java, name)
                     .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)

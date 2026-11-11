@@ -53,8 +53,6 @@ class ReleaseScreenTest {
         val requests = mutableListOf<Boolean>()
         compose.setContent { MaterialTheme { SettingsScreen(vm, actions.copy(setReminders = { requests += it })) } }
         compose.waitUntil(5_000) { compose.onAllNodes(hasScrollToNodeAction()).fetchSemanticsNodes().isNotEmpty() }
-        compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Android settings", substring = true))
-        compose.onNodeWithText("Android settings", substring = true).performClick()
         compose.onNode(hasScrollToNodeAction()).performScrollToNode(hasText("Local schedule reminders"))
         compose.waitUntil(5_000) { compose.onAllNodesWithText("Local schedule reminders").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Local schedule reminders").performScrollTo().performClick()

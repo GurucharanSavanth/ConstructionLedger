@@ -37,6 +37,120 @@ import java.util.UUID
 
 @RunWith(AndroidJUnit4::class)
 class ReminderDeliveryTest {
+    @Test fun overflowRemainsBoundedAcrossRetryReopenAndCancellation() = runBlocking<Unit> {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val base = instrumentation.targetContext
+        check(base.packageName.endsWith(".verification")) { "Use the disposable verification application" }
+        val sandbox = File(base.cacheDir, "reminder-overflow-${UUID.randomUUID()}").apply { check(mkdirs()) }
+        val context = object : android.content.ContextWrapper(base) {
+            override fun getApplicationContext(): Context = this
+            override fun getFilesDir() = File(sandbox, "files").apply { mkdirs() }
+            override fun getDatabasePath(name: String) = File(sandbox, name)
+            override fun openOrCreateDatabase(name: String, mode: Int, factory: SQLiteDatabase.CursorFactory?): SQLiteDatabase =
+                SQLiteDatabase.openOrCreateDatabase(getDatabasePath(name), factory)
+            override fun openOrCreateDatabase(name: String, mode: Int, factory: SQLiteDatabase.CursorFactory?, errorHandler: DatabaseErrorHandler?): SQLiteDatabase =
+                SQLiteDatabase.openOrCreateDatabase(getDatabasePath(name).path, factory, errorHandler)
+        }
+        val settingsKey = stringPreferencesKey("settings")
+        val deliveriesKey = stringPreferencesKey("reminder_deliveries")
+        val previous = base.ledgerPreferences.data.first()
+        val manager = base.getSystemService(NotificationManager::class.java)
+        val previousNotifications = manager.activeNotifications.filter { it.notification.channelId == "local_instalments" }
+        var repository = LedgerRepository(context)
+        fun posted() = manager.activeNotifications.filter {
+            it.notification.channelId == "local_instalments" &&
+                (it.tag?.startsWith("overflow-") == true || it.tag == ReminderScheduler.OVERFLOW_TAG)
+        }
+        suspend fun awaitCount(count: Int) {
+            try { withTimeout(10_000) { while (posted().size != count) delay(50) } }
+            catch (failure: TimeoutCancellationException) {
+                throw AssertionError("Expected $count notifications; actual " + posted().joinToString { "${it.tag}:${it.id}:${it.notification.extras.getCharSequence(Notification.EXTRA_TEXT)}" }, failure)
+            }
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 33) instrumentation.uiAutomation.grantRuntimePermission(base.packageName, Manifest.permission.POST_NOTIFICATIONS)
+            previousNotifications.forEach { manager.cancel(it.tag, it.id) }
+            base.ledgerPreferences.edit {
+                it[settingsKey] = JSONObject(previous[settingsKey] ?: "{}").put("reminders", true).toString()
+                it.remove(deliveriesKey)
+            }
+            repository.saveProject(ProjectInfo("overflow-project", "Overflow fixture"))
+            repeat(51) { index -> repository.saveInstalment(InstalmentInput(
+                id = "overflow-%02d".format(index), projectId = "overflow-project", title = "Schedule $index",
+                amountPaise = 5_000, dueDate = LocalDate.now().toString(), remind = true)) }
+            ReminderScheduler.notifyDue(context, repository)
+            awaitCount(21)
+            assertTrue("Including Android's automatic group summary must remain bounded",
+                manager.activeNotifications.count { it.notification.channelId == "local_instalments" } <= 22)
+            val summary = posted().single { it.tag == ReminderScheduler.OVERFLOW_TAG }
+            assertTrue(summary.notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString().startsWith("31 more payment reminders"))
+            val firstPosts = posted().associate { it.tag to it.postTime }
+            val history = JSONObject(base.ledgerPreferences.data.first()[deliveriesKey]!!).getJSONObject("entries")
+            assertEquals(21, history.length())
+            assertFalse("Overflow schedules must not be recorded as individually submitted", history.has("overflow-50"))
+            ReminderScheduler.notifyDue(context, repository)
+            assertEquals(firstPosts, posted().associate { it.tag to it.postTime })
+            repository.close()
+            repository = LedgerRepository(context)
+            ReminderScheduler.notifyDue(context, repository)
+            assertEquals(firstPosts, posted().associate { it.tag to it.postTime })
+            repository.savePayment(PaymentInput(projectId = "overflow-project", amountPaise = 5_000,
+                date = LocalDate.now().toString(), instalmentId = "overflow-00"))
+            ReminderScheduler.refreshPosted(context, repository)
+            try {
+                withTimeout(10_000) {
+                    while (posted().none { it.tag == "overflow-20" } || posted().singleOrNull { it.tag == ReminderScheduler.OVERFLOW_TAG }
+                        ?.notification?.extras?.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.startsWith("30 more payment reminders") != true) delay(50)
+                }
+            } catch (failure: TimeoutCancellationException) {
+                throw AssertionError("Promotion requires overflow-20 and digest30; actual " + posted().joinToString {
+                    "${it.tag}:${it.notification.extras.getCharSequence(Notification.EXTRA_TEXT)}"
+                }, failure)
+            }
+            assertFalse(posted().any { it.tag == "overflow-00" })
+            assertEquals(21, posted().size)
+            assertTrue(posted().single { it.tag == ReminderScheduler.OVERFLOW_TAG }.notification.extras
+                .getCharSequence(Notification.EXTRA_TEXT).toString().startsWith("30 more payment reminders"))
+            val originalSummaryKey = JSONObject(base.ledgerPreferences.data.first()[deliveriesKey]!!).getJSONObject("entries")
+                .getString(ReminderScheduler.OVERFLOW_TAG)
+            repository.savePayment(PaymentInput(projectId = "overflow-project", amountPaise = 1_000,
+                date = LocalDate.now().toString(), instalmentId = "overflow-50"))
+            ReminderScheduler.refreshPosted(context, repository)
+            val updatedSummaryKey = JSONObject(base.ledgerPreferences.data.first()[deliveriesKey]!!).getJSONObject("entries")
+                .getString(ReminderScheduler.OVERFLOW_TAG)
+            assertNotEquals("Even an undisplayed overflow member must refresh summary identity", originalSummaryKey, updatedSummaryKey)
+            repository.savePayment(PaymentInput(projectId = "overflow-project", amountPaise = 4_000,
+                date = LocalDate.now().toString(), instalmentId = "overflow-50"))
+            for (schedule in repository.instalments("overflow-project").first().filter { it.id >= "overflow-20" && it.id != "overflow-50" }) {
+                repository.cancelInstalment(schedule.id, schedule.revision)
+            }
+            ReminderScheduler.refreshPosted(context, repository)
+            awaitCount(19)
+            assertFalse(posted().any { it.tag == ReminderScheduler.OVERFLOW_TAG })
+            ReminderScheduler.notifyDue(context, repository)
+            awaitCount(19)
+            val restored = repository.exportRecords()
+            for (table in listOf("reminders", "instalments")) {
+                val rows = restored.getJSONArray(table)
+                for (index in rows.length() - 1 downTo 0) {
+                    if (rows.getJSONObject(index).getString("id") in (1..19).map { "overflow-%02d".format(it) }) rows.remove(index)
+                }
+            }
+            repository.replaceRecords(restored)
+            ReminderScheduler.refreshPosted(context, repository)
+            awaitCount(0)
+        } finally {
+            posted().forEach { manager.cancel(it.tag, it.id) }
+            base.ledgerPreferences.edit { preferences ->
+                for (key in listOf(settingsKey, deliveriesKey)) previous[key]?.let { preferences[key] = it } ?: preferences.remove(key)
+            }
+            previousNotifications.forEach { manager.notify(it.tag, it.id, it.notification) }
+            repository.close()
+            check(sandbox.canonicalFile.parentFile == base.cacheDir.canonicalFile)
+            sandbox.deleteRecursively()
+        }
+    }
+
     @Test fun notificationsReconcilePaidEditedCancelledAndRemovedSchedules() = runBlocking<Unit> {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val base = instrumentation.targetContext
@@ -49,6 +163,7 @@ class ReminderDeliveryTest {
                 return super.getSystemService(name)
             }
             override fun getApplicationContext(): Context = this
+            override fun getFilesDir() = File(sandbox, "files").apply { mkdirs() }
             override fun getDatabasePath(name: String) = File(sandbox, name)
             // Android 8 opens through Context instead of resolving getDatabasePath first.
             override fun openOrCreateDatabase(name: String, mode: Int, factory: SQLiteDatabase.CursorFactory?): SQLiteDatabase =
@@ -66,7 +181,7 @@ class ReminderDeliveryTest {
         val viewModels = ViewModelStore()
         lateinit var vm: LedgerViewModel
         suspend fun command(action: suspend () -> Unit) {
-            withContext(Dispatchers.Main) { vm.command("Reminder mutation saved", action) }
+            withContext(Dispatchers.Main) { vm.command("Reminder mutation saved", action = action) }
             withTimeout(5_000) { while (vm.state.value.saving) delay(50) }
             assertNull(vm.state.value.error)
             assertEquals("Reminder mutation saved", vm.state.value.message)

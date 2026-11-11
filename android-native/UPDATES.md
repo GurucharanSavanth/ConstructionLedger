@@ -17,3 +17,5 @@ The user selects **Install update**, allows installation from BuildLedger when A
 Already-installed V23 binaries retain the old tag-matching bug until replaced. Install the first corrected, same-key signed build manually, or publish it once under its matching `f.NNN` tag so the older checker can detect it. Subsequent releases may use arbitrary tags.
 
 This direct APK distribution flow is not a Google Play updater. The previous policy forbidding native Internet permission was superseded by the owner's update request on 2026-11-10.
+
+Manual checks display the installed version, offer cancellation, and provide Retry for network or verification failures. Offline, timeout, missing-release and rate-limit errors have distinct guidance; none is treated as up to date. Cancellation is observed between network reads and hashing chunks; a blocked read can take up to the configured 30-second timeout. Ready update metadata survives Activity recreation, including the trip to installation settings; cached APK bytes are still reverified before installation.

@@ -112,10 +112,12 @@ internal fun Choice(label: String, selected: String?, options: List<Pair<String,
         AlertDialog(onDismissRequest = { open = false }, title = { Text("Choose $label") }, text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Field("Search $label", query, { query = it })
+                val matching = options.filter { it.second.contains(query.trim(), true) }
+                if (matching.isEmpty()) Text("No matches. Try another search.", color = WebColors.muted)
                 LazyColumn(Modifier.heightIn(max = 340.dp)) {
                     if (allowNone) item { TextButton({ choose(""); open = false }, Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("None / unclassified") } }
                     if (onCreate != null) item { TextButton({ open = false; onCreate() }, Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Create category…") } }
-                    items(options.filter { it.second.contains(query, true) }, key = { it.first }) { (id, name) ->
+                    items(matching, key = { it.first }) { (id, name) ->
                         TextButton({ choose(id); open = false }, Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text(name) }
                     }
                 }
@@ -148,8 +150,8 @@ internal fun Title(text: String) { Text(text, Modifier.semantics { heading() }, 
 
 @Composable
 internal fun Confirm(title: String, explanation: String, confirm: () -> Unit, dismiss: () -> Unit) {
-    AlertDialog(onDismissRequest = dismiss, title = { Text(title) }, text = { Text(explanation) },
-        confirmButton = { TextButton({ dismiss(); confirm() }) { Text(title.removeSuffix("?")) } },
+    AlertDialog(onDismissRequest = dismiss, title = { Text(title.trim()) }, text = { Text(explanation.trim()) },
+        confirmButton = { TextButton({ dismiss(); confirm() }) { Text(title.trim().removeSuffix("?")) } },
         dismissButton = { TextButton(dismiss) { Text("Cancel") } })
 }
 
